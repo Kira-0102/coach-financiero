@@ -15,10 +15,10 @@
   <div class="error-banner" id="errorBanner"></div>
 
   <label for="email">Email</label>
-  <input type="email" id="email" placeholder="tu@email.com" style="margin-bottom:14px;" />
+  <input type="email" id="email" placeholder="tu@email.com" autocomplete="email" style="margin-bottom:14px;" />
 
   <label for="password">Contraseña</label>
-  <input type="password" id="password" placeholder="••••••••" style="margin-bottom:20px;" />
+  <input type="password" id="password" placeholder="••••••••" autocomplete="current-password" style="margin-bottom:20px;" />
 
   <button class="btn-primary" id="submitBtn" style="width:100%; margin-bottom:14px;">
     Entrar
@@ -55,6 +55,7 @@
     submitBtn.textContent = mode === "login" ? "Entrar" : "Registrarme";
     toggleText.textContent = mode === "login" ? "¿No tenés cuenta?" : "¿Ya tenés cuenta?";
     toggleModeBtn.textContent = mode === "login" ? "Registrate" : "Iniciá sesión";
+    document.getElementById("password").setAttribute("autocomplete", mode === "signup" ? "new-password" : "current-password");
     clearError();
   });
 
@@ -77,9 +78,16 @@
 
     try {
       if (mode === "signup") {
-        const { error } = await supabase.auth.signUp({ email, password });
+        const { data, error } = await supabase.auth.signUp({ email, password });
         if (error) throw error;
-        showError("Cuenta creada. Revisá tu correo si tu proyecto pide confirmación, o entrá directo.");
+        if (data.session) {
+          // La confirmación por correo está desactivada: Supabase ya
+          // nos dio una sesión activa, no hace falta pedirle que
+          // vuelva a escribir sus datos para iniciar sesión de nuevo.
+          window.location.href = "app.html";
+          return;
+        }
+        showError("Cuenta creada. Revisá tu correo para confirmarla antes de entrar.");
       } else {
         const { error } = await supabase.auth.signInWithPassword({ email, password });
         if (error) throw error;
@@ -97,6 +105,7 @@
   function traducirError(msg) {
     if (msg.includes("Invalid login credentials")) return "Email o contraseña incorrectos.";
     if (msg.includes("User already registered")) return "Ese email ya tiene una cuenta. Iniciá sesión.";
+    if (msg.includes("Email not confirmed")) return "Confirmá tu correo antes de entrar — revisá tu bandeja de entrada.";
     return "No se pudo completar la acción. Intentá de nuevo.";
   }
 
