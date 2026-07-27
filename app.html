@@ -245,6 +245,7 @@ function render() {
 // ONBOARDING — PASO 1: CUENTA
 // ---------------------------------------------------------------
 function renderOnboardingAccount() {
+  const existing = state.account;
   root.innerHTML = `
     <div class="screen">
       <p class="step-label">Paso 1 de 4</p>
@@ -252,24 +253,24 @@ function renderOnboardingAccount() {
       <div class="error-banner" id="err"></div>
 
       <label>Nombre de la cuenta</label>
-      <input id="accName" placeholder="Ej. Banreservas" style="margin-bottom:2px;" />
+      <input id="accName" placeholder="Ej. Banreservas" style="margin-bottom:2px;" value="${existing ? esc(existing.name) : ""}" />
       <p class="hint">Esto es solo para que la reconozcas vos.</p>
 
       <label>Tipo</label>
       <div class="type-grid" id="typeGrid">
-        <div class="type-option selected" data-type="bank">Banco</div>
-        <div class="type-option" data-type="cash">Efectivo</div>
-        <div class="type-option" data-type="savings">Ahorro</div>
+        <div class="type-option ${(!existing || existing.type === "bank") ? "selected" : ""}" data-type="bank">Banco</div>
+        <div class="type-option ${existing?.type === "cash" ? "selected" : ""}" data-type="cash">Efectivo</div>
+        <div class="type-option ${existing?.type === "savings" ? "selected" : ""}" data-type="savings">Ahorro</div>
       </div>
 
       <label>¿Cuánto tenés ahí ahora mismo?</label>
-      <input id="accBalance" type="number" placeholder="RD$0" style="margin-bottom:20px;" />
+      <input id="accBalance" type="number" placeholder="RD$0" style="margin-bottom:20px;" value="${existing ? existing.current_balance : ""}" />
 
       <button class="btn-primary" id="continueBtn" style="width:100%;">Continuar</button>
     </div>
   `;
 
-  let selectedType = "bank";
+  let selectedType = existing?.type || "bank";
   document.querySelectorAll(".type-option").forEach(el => {
     el.addEventListener("click", () => {
       document.querySelectorAll(".type-option").forEach(o => o.classList.remove("selected"));
@@ -288,9 +289,11 @@ function renderOnboardingAccount() {
       return;
     }
     const balanceNum = balanceVal === "" ? 0 : Number(balanceVal);
-    const { error } = await supabase.from("accounts").insert({
-      user_id: user.id, name, type: selectedType, current_balance: balanceNum,
-    });
+    // Si ya existe una cuenta (volviste desde un paso más adelante),
+    // la actualizamos en vez de crear una segunda por accidente.
+    const { error } = existing
+      ? await supabase.from("accounts").update({ name, type: selectedType, current_balance: balanceNum }).eq("id", existing.id)
+      : await supabase.from("accounts").insert({ user_id: user.id, name, type: selectedType, current_balance: balanceNum });
     if (error) {
       errEl.textContent = "No se pudo guardar. Intentá de nuevo.";
       errEl.classList.add("visible");
@@ -305,7 +308,7 @@ function renderOnboardingAccount() {
 // ONBOARDING — PASO 2: INGRESO
 // ---------------------------------------------------------------
 function renderOnboardingIncome() {
-  let frequency = "monthly";
+  let frequency = state.profile?.pay_frequency || "monthly";
 
   function paint() {
     root.innerHTML = `
@@ -320,7 +323,7 @@ function renderOnboardingIncome() {
         </div>
 
         <label style="text-align:center;">${frequency === "biweekly" ? "¿Cuánto ganás cada quincena?" : "¿Cuánto ganás al mes?"}</label>
-        <input id="incAmount" type="number" placeholder="RD$0" style="text-align:center; font-size:18px; margin-bottom:4px;" />
+        <input id="incAmount" type="number" placeholder="RD$0" style="text-align:center; font-size:18px; margin-bottom:4px;" value="${state.profile?.declared_monthly_income ?? ""}" />
         <p class="hint" id="incHint" style="text-align:center;">Antes de descontar tus gastos fijos.</p>
 
         <div class="error-banner" id="err"></div>
@@ -346,8 +349,6 @@ function renderOnboardingIncome() {
     });
 
     document.getElementById("backBtn").addEventListener("click", () => {
-      // volver a paso 1 implicaría borrar la cuenta creada; en vez de eso,
-      // dejamos avanzar solamente hacia adelante en Fase 1.
       renderOnboardingAccount();
     });
 
@@ -420,7 +421,8 @@ function renderOnboardingFixed() {
         </div>
 
         <div class="btn-row" style="margin-top:16px;">
-          <button class="btn-primary" id="continueBtn" style="width:100%;">Continuar a tu meta</button>
+          <button class="btn-back" id="backBtn">‹</button>
+          <button class="btn-primary" id="continueBtn" style="flex:1;">Continuar a tu meta</button>
         </div>
       </div>
     `;
@@ -447,6 +449,7 @@ function renderOnboardingFixed() {
       paint();
     });
 
+    document.getElementById("backBtn").addEventListener("click", () => renderOnboardingIncome());
     document.getElementById("continueBtn").addEventListener("click", () => renderOnboardingGoal());
   }
   paint();
