@@ -1,0 +1,1601 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Coach Financiero</title>
+<link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+
+<div id="root">
+  <div class="screen" style="text-align:center; padding:60px 24px;">
+    <p style="font-size:13px; color:var(--text-muted);">Cargando tus datos…</p>
+  </div>
+</div>
+
+<script type="module">
+import { supabase } from "./js/supabaseClient.js";
+
+const CATEGORY_ICONS = {
+  Comida: "🍽️", Transporte: "🚌", Vivienda: "🏠", Salud: "💊",
+  Ocio: "🎮", Educación: "🎓", Ropa: "👕", Otro: "•",
+};
+
+const DEBT_TYPES = [
+  { value: "tarjeta_credito", label: "Tarjeta de crédito", icon: "💳" },
+  { value: "prestamo_personal", label: "Préstamo personal", icon: "🏦" },
+  { value: "prestamista", label: "Prestamista", icon: "🤝" },
+  { value: "financiamiento_vehiculo", label: "Financiamiento de vehículo", icon: "🚗" },
+  { value: "financiamiento_electrodomestico", label: "Financiamiento de electrodoméstico", icon: "🧊" },
+  { value: "hipoteca", label: "Hipoteca", icon: "🏠" },
+  { value: "otro", label: "Otro", icon: "📄" },
+];
+
+let user = null;
+let categories = [];
+let state = { account: null, profile: null, goals: [], fixed: [], debts: [], transactions: [], budgets: [] };
+let tab = "inicio";
+let goalMode = "byDeadline"; // solo un modo en Fase 1, pero dejamos la variable por si acaso
+
+const root = document.getElementById("root");
+
+function money(n) {
+  const num = Number(n) || 0;
+  return "RD$" + num.toLocaleString("es-DO", { maximumFractionDigits: 0 });
+}
+
+// Escapa texto escrito por el usuario antes de insertarlo en HTML.
+// Sin esto, un nombre como: Tarjeta "Popular"  rompe los campos de
+// edición, y cualquier símbolo < o & puede romper el renderizado.
+function esc(str) {
+  if (str == null) return "";
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+// Aviso breve arriba de la pantalla, para confirmar que algo se guardó
+// (antes, editar no daba ninguna señal de que había funcionado).
+function showToast(msg) {
+  let toast = document.getElementById("toastMsg");
+  if (!toast) {
+    toast = document.createElement("div");
+    toast.id = "toastMsg";
+    toast.style.cssText = "position:fixed; top:20px; left:50%; transform:translateX(-50%); background:var(--teal); color:white; padding:10px 18px; border-radius:20px; font-size:13px; z-index:999; box-shadow:0 4px 14px rgba(0,0,0,0.18); opacity:0; transition:opacity 0.25s; pointer-events:none;";
+    document.body.appendChild(toast);
+  }
+  toast.textContent = msg;
+  toast.style.opacity = "1";
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => { toast.style.opacity = "0"; }, 1400);
+}
+
+// Reemplaza el confirm() nativo del navegador (feo, fuera de estilo)
+// por un modal propio, coherente con el resto de la app.
+function confirmAction(message) {
+  return new Promise((resolve) => {
+    const modal = document.getElementById("logModal");
+    modal.classList.add("visible");
+    modal.innerHTML = `
+      <div class="modal-box" style="text-align:center;">
+        <p style="font-size:14px; margin:0 0 20px; line-height:1.5;">${message}</p>
+        <div class="btn-row">
+          <button class="btn-secondary" id="confirmNo">Cancelar</button>
+          <button class="btn-primary" id="confirmYes" style="background:var(--danger-text);">Sí, borrar</button>
+        </div>
+      </div>
+    `;
+    const cleanup = (result) => { modal.classList.remove("visible"); modal.innerHTML = ""; resolve(result); };
+    document.getElementById("confirmNo").addEventListener("click", () => cleanup(false));
+    document.getElementById("confirmYes").addEventListener("click", () => cleanup(true));
+  });
+}
+
+// ---------------------------------------------------------------
+// CARGA INICIAL
+// ---------------------------------------------------------------
+async function init() {
+  try {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) { window.location.href = "index.html"; return; }
+    user = session.user;
+
+    const { data: cats } = await supabase.from("categories").select("*").order("name");
+    categories = cats || [];
+
+    await loadState();
+    render();
+  } catch (e) {
+    root.innerHTML = `
+      <div class="screen" style="text-align:center; padding:50px 24px;">
+        <div class="icon-circle" style="background:var(--danger-bg); margin:0 auto 14px;">⚠️</div>
+        <p style="font-size:14px; margin:0 0 8px;">No pudimos cargar tus datos</p>
+        <p style="font-size:12px; color:var(--text-muted); margin:0 0 20px; line-height:1.5;">Revisá tu conexión a internet e intentá de nuevo.</p>
+        <button class="btn-primary" style="width:100%;" onclick="window.location.reload()">Reintentar</button>
+      </div>
+    `;
+  }
+}
+
+async function loadState() {
+  const [{ data: accounts }, { data: profile }, { data: goals }, { data: fixed }, { data: debts }, { data: transactions }, { data: budgets }] =
+    await Promise.all([
+      supabase.from("accounts").select("*").order("created_at").limit(1),
+      supabase.from("profiles").select("*").eq("id", user.id).single(),
+      supabase.from("goals").select("*").order("created_at"),
+      supabase.from("recurring_expense_templates").select("*, categories(name)").eq("active", true).order("created_at"),
+      supabase.from("debts").select("*").order("created_at"),
+      // Sin límite: el saldo se calcula sumando TODAS las transacciones.
+      // Con un límite, el saldo quedaría mal apenas se superen esas filas.
+      supabase.from("transactions").select("*, categories(name)").order("occurred_at", { ascending: false }),
+      supabase.from("budgets").select("*, categories(name)").is("effective_to", null),
+    ]);
+
+  state = {
+    account: accounts && accounts[0] ? accounts[0] : null,
+    profile: profile || null,
+    goals: goals || [],
+    fixed: fixed || [],
+    debts: debts || [],
+    transactions: transactions || [],
+    budgets: budgets || [],
+  };
+}
+
+function spentThisMonthTotal() {
+  const now = new Date();
+  const start = new Date(now.getFullYear(), now.getMonth(), 1);
+  return state.transactions
+    .filter(t => new Date(t.occurred_at) >= start && Number(t.amount) < 0)
+    .reduce((s, t) => s + Math.abs(Number(t.amount)), 0);
+}
+
+// Ritmo REAL necesario para cumplir la meta: usa lo que falta ahorrar
+// y los meses que quedan de verdad (no el plan original completo),
+// para no subestimar ni sobreestimar el riesgo si el usuario va
+// adelantado o atrasado respecto a su plan inicial.
+function goalMonthlyPace(g) {
+  if (!g || !g.target_months) return 0;
+  const created = new Date(g.created_at);
+  const now = new Date();
+  const elapsedMonths = (now.getFullYear() - created.getFullYear()) * 12 + (now.getMonth() - created.getMonth());
+  const remainingMonths = Math.max(1, g.target_months - elapsedMonths);
+  const remainingAmount = Math.max(0, Number(g.target_amount) - Number(g.current_amount));
+  return remainingAmount / remainingMonths;
+}
+
+// Suma el ritmo mensual necesario de TODAS las metas activas — porque
+// todas compiten por el mismo disponible, no alcanza con mirar una sola.
+function totalGoalMonthlyPace() {
+  return state.goals.reduce((sum, g) => sum + goalMonthlyPace(g), 0);
+}
+
+function totalFixed() {
+  return state.fixed.reduce((s, f) => s + Number(f.estimated_amount), 0);
+}
+function monthlyIncome() {
+  if (!state.profile || state.profile.declared_monthly_income == null) return 0;
+  const base = Number(state.profile.declared_monthly_income);
+  return state.profile.pay_frequency === "biweekly" ? base * 2 : base;
+}
+function disponible() {
+  return monthlyIncome() - totalFixed();
+}
+function balance() {
+  if (!state.account) return 0;
+  const accountTx = state.transactions.filter(t => t.account_id === state.account.id);
+  return Number(state.account.current_balance) + accountTx.reduce((s, t) => s + Number(t.amount), 0);
+}
+
+function totalDebt() {
+  return state.debts.reduce((s, d) => s + Number(d.current_balance), 0);
+}
+
+function spentThisMonthByCategory(catId) {
+  const now = new Date();
+  const start = new Date(now.getFullYear(), now.getMonth(), 1);
+  return state.transactions
+    .filter(t => t.category_id === catId && new Date(t.occurred_at) >= start && Number(t.amount) < 0)
+    .reduce((s, t) => s + Math.abs(Number(t.amount)), 0);
+}
+
+// Motor de Baseline Score: combina capacidad de ahorro, colchón de
+// liquidez, y nivel de endeudamiento relativo al ingreso. 0-100.
+// El Behavior Score se queda en "Aprendiendo" hasta que exista el
+// campo de intención por transacción (fuera de Fase 1, ver ADR-005).
+function computeBaselineScore() {
+  const income = monthlyIncome();
+  if (income <= 0) return null;
+
+  const savingsCapacity = Math.max(0, disponible()) / income; // 0 a 1+
+  const liquidityBuffer = balance() / income; // meses de colchón, aprox
+  const debtRatio = totalDebt() / (income * 3); // 3 meses de ingreso como referencia
+
+  const score =
+    40 * Math.min(1, savingsCapacity * 2) +
+    30 * Math.min(1, liquidityBuffer) +
+    30 * (1 - Math.min(1, debtRatio));
+
+  return Math.round(Math.max(0, Math.min(100, score)));
+}
+
+function determineStep() {
+  if (!state.account) return "account";
+  if (state.profile == null || state.profile.declared_monthly_income == null) return "income";
+  if (state.goals.length === 0) return "fixed";
+  return "app";
+}
+
+// ---------------------------------------------------------------
+// RENDER PRINCIPAL
+// ---------------------------------------------------------------
+function render() {
+  const step = determineStep();
+  if (step === "account") return renderOnboardingAccount();
+  if (step === "income") return renderOnboardingIncome();
+  if (step === "fixed") return renderOnboardingFixed();
+  return renderApp();
+}
+
+// ---------------------------------------------------------------
+// ONBOARDING — PASO 1: CUENTA
+// ---------------------------------------------------------------
+function renderOnboardingAccount() {
+  root.innerHTML = `
+    <div class="screen">
+      <p class="step-label">Paso 1 de 4</p>
+      <h1>Agregá tu primera cuenta</h1>
+      <div class="error-banner" id="err"></div>
+
+      <label>Nombre de la cuenta</label>
+      <input id="accName" placeholder="Ej. Banreservas, Efectivo, Ahorros" style="margin-bottom:2px;" />
+      <p class="hint">Esto es solo para que la reconozcas vos.</p>
+
+      <label>Tipo</label>
+      <div class="type-grid" id="typeGrid">
+        <div class="type-option selected" data-type="bank">Banco</div>
+        <div class="type-option" data-type="cash">Efectivo</div>
+        <div class="type-option" data-type="savings">Ahorro</div>
+      </div>
+
+      <label>¿Cuánto tenés ahí ahora mismo?</label>
+      <input id="accBalance" type="number" placeholder="RD$0" style="margin-bottom:20px;" />
+
+      <button class="btn-primary" id="continueBtn" style="width:100%;">Continuar</button>
+    </div>
+  `;
+
+  let selectedType = "bank";
+  document.querySelectorAll(".type-option").forEach(el => {
+    el.addEventListener("click", () => {
+      document.querySelectorAll(".type-option").forEach(o => o.classList.remove("selected"));
+      el.classList.add("selected");
+      selectedType = el.dataset.type;
+    });
+  });
+
+  document.getElementById("continueBtn").addEventListener("click", async () => {
+    const name = document.getElementById("accName").value.trim();
+    const balanceVal = document.getElementById("accBalance").value;
+    const errEl = document.getElementById("err");
+    if (!name) {
+      errEl.textContent = "Completá el nombre de la cuenta.";
+      errEl.classList.add("visible");
+      return;
+    }
+    const balanceNum = balanceVal === "" ? 0 : Number(balanceVal);
+    const { error } = await supabase.from("accounts").insert({
+      user_id: user.id, name, type: selectedType, current_balance: balanceNum,
+    });
+    if (error) {
+      errEl.textContent = "No se pudo guardar. Intentá de nuevo.";
+      errEl.classList.add("visible");
+      return;
+    }
+    await loadState();
+    render();
+  });
+}
+
+// ---------------------------------------------------------------
+// ONBOARDING — PASO 2: INGRESO
+// ---------------------------------------------------------------
+function renderOnboardingIncome() {
+  let frequency = "monthly";
+
+  function paint() {
+    root.innerHTML = `
+      <div class="screen">
+        <p class="step-label">Paso 2 de 4</p>
+        <h1>¿Con qué frecuencia cobrás?</h1>
+        <p class="subtitle">Primero esto, para saber qué monto pedirte después.</p>
+
+        <div class="type-grid" style="grid-template-columns:1fr 1fr;" id="freqGrid">
+          <div class="type-option ${frequency === "monthly" ? "selected" : ""}" data-f="monthly">Fin de mes</div>
+          <div class="type-option ${frequency === "biweekly" ? "selected" : ""}" data-f="biweekly">Quincenal</div>
+        </div>
+
+        <label style="text-align:center;">${frequency === "biweekly" ? "¿Cuánto ganás cada quincena?" : "¿Cuánto ganás al mes?"}</label>
+        <input id="incAmount" type="number" placeholder="RD$0" style="text-align:center; font-size:18px; margin-bottom:4px;" />
+        <p class="hint" id="incHint" style="text-align:center;">Antes de descontar tus gastos fijos.</p>
+
+        <div class="error-banner" id="err"></div>
+
+        <div class="btn-row">
+          <button class="btn-back" id="backBtn">‹</button>
+          <button class="btn-primary" id="continueBtn">Continuar</button>
+        </div>
+      </div>
+    `;
+
+    document.querySelectorAll("#freqGrid .type-option").forEach(el => {
+      el.addEventListener("click", () => { frequency = el.dataset.f; paint(); });
+    });
+
+    document.getElementById("incAmount").addEventListener("input", (e) => {
+      const hint = document.getElementById("incHint");
+      if (frequency === "biweekly" && e.target.value) {
+        hint.textContent = `Eso son ${money(Number(e.target.value) * 2)} al mes — así lo vamos a usar en tus cálculos.`;
+      } else {
+        hint.textContent = "Antes de descontar tus gastos fijos.";
+      }
+    });
+
+    document.getElementById("backBtn").addEventListener("click", () => {
+      // volver a paso 1 implicaría borrar la cuenta creada; en vez de eso,
+      // dejamos avanzar solamente hacia adelante en Fase 1.
+      renderOnboardingAccount();
+    });
+
+    document.getElementById("continueBtn").addEventListener("click", async () => {
+      const amount = document.getElementById("incAmount").value;
+      const errEl = document.getElementById("err");
+      if (!amount) {
+        errEl.textContent = "Completá el monto.";
+        errEl.classList.add("visible");
+        return;
+      }
+      const { error } = await supabase.from("profiles").update({
+        declared_monthly_income: Number(amount), pay_frequency: frequency,
+      }).eq("id", user.id);
+      if (error) {
+        errEl.textContent = "No se pudo guardar. Intentá de nuevo.";
+        errEl.classList.add("visible");
+        return;
+      }
+      await loadState();
+      render();
+    });
+  }
+
+  paint();
+}
+
+// ---------------------------------------------------------------
+// ONBOARDING — PASO 3: GASTOS FIJOS
+// ---------------------------------------------------------------
+function renderOnboardingFixed() {
+  function paint() {
+    const rows = state.fixed.map(f => `
+      <div class="list-item">
+        <span>${CATEGORY_ICONS[f.categories?.name] || "•"} ${esc(f.name)}</span>
+        <span>${money(f.estimated_amount)}</span>
+      </div>
+    `).join("");
+
+    root.innerHTML = `
+      <div class="screen">
+        <p class="step-label">Paso 3 de 4</p>
+        <h1>Sumá tus gastos fijos</h1>
+        <p class="subtitle">Los que se repiten cada mes. Podés agregar más después.</p>
+
+        <div id="fixedList" style="max-height:140px; overflow-y:auto; margin-bottom:10px;">${rows}</div>
+
+        <div class="error-banner" id="err"></div>
+
+        <input id="fName" placeholder="Ej. Casa, Gym, Luz" style="margin-bottom:8px;" />
+        <label>Categoría</label>
+        <select id="fCat" style="margin-bottom:8px;">
+          <option value="" selected>Elegí una categoría</option>
+          ${categories.map(c => `<option value="${c.id}">${c.name}</option>`).join("")}
+        </select>
+        <input id="fAmount" type="number" placeholder="RD$0" style="margin-bottom:10px;" />
+        <button class="btn-secondary" id="addFixedBtn" style="width:100%; margin-bottom:16px;">+ Agregar</button>
+
+        <div class="card accent">
+          <div class="row-between" style="font-size:12px; margin-bottom:4px;">
+            <span>Ingreso</span><span>${money(monthlyIncome())}</span>
+          </div>
+          <div class="row-between" style="font-size:12px; margin-bottom:6px;">
+            <span>Gastos fijos</span><span>-${money(totalFixed())}</span>
+          </div>
+          <div class="row-between" style="font-weight:600; padding-top:6px; border-top:1px solid #bfdad8;">
+            <span>Te queda disponible</span><span>${money(disponible())}</span>
+          </div>
+        </div>
+
+        <div class="btn-row" style="margin-top:16px;">
+          <button class="btn-primary" id="continueBtn" style="width:100%;">Continuar a tu meta</button>
+        </div>
+      </div>
+    `;
+
+    document.getElementById("addFixedBtn").addEventListener("click", async () => {
+      const name = document.getElementById("fName").value.trim();
+      const catId = document.getElementById("fCat").value;
+      const amount = document.getElementById("fAmount").value;
+      const errEl = document.getElementById("err");
+      if (!name || !catId || !amount) {
+        errEl.textContent = "Completá el nombre, la categoría y el monto.";
+        errEl.classList.add("visible");
+        return;
+      }
+      const { error } = await supabase.from("recurring_expense_templates").insert({
+        user_id: user.id, name, category_id: catId, estimated_amount: Number(amount),
+      });
+      if (error) {
+        errEl.textContent = "No se pudo guardar. Intentá de nuevo.";
+        errEl.classList.add("visible");
+        return;
+      }
+      await loadState();
+      paint();
+    });
+
+    document.getElementById("continueBtn").addEventListener("click", () => renderOnboardingGoal());
+  }
+  paint();
+}
+
+// ---------------------------------------------------------------
+// ONBOARDING — PASO 4: META
+// ---------------------------------------------------------------
+function renderOnboardingGoal() {
+  function paint() {
+    const amountVal = document.getElementById("gAmount")?.value || "";
+    const monthsVal = document.getElementById("gMonths")?.value || "";
+    const target = Number(amountVal) || 0;
+    const months = Number(monthsVal) || 0;
+    const monthly = months > 0 ? target / months : 0;
+    const pct = disponible() > 0 && monthly > 0 ? Math.round((monthly / disponible()) * 100) : 0;
+
+    root.innerHTML = `
+      <div class="screen">
+        <p class="step-label">Paso 4 de 4</p>
+        <h1>Creá tu primera meta</h1>
+
+        <label>¿Cómo la llamamos?</label>
+        <input id="gName" placeholder="Ej. Fondo de emergencia" style="margin-bottom:12px;" value="${document.getElementById("gName")?.value || ""}" />
+
+        <label>Monto objetivo</label>
+        <input id="gAmount" type="number" placeholder="RD$0" style="margin-bottom:12px;" value="${amountVal}" />
+
+        <label>¿En cuántos meses?</label>
+        <input id="gMonths" type="number" placeholder="Ej. 6" style="margin-bottom:12px;" value="${monthsVal}" />
+
+        <div class="error-banner" id="err"></div>
+
+        ${target && months
+          ? `<div class="card ${pct <= 40 ? "success" : "warning"}">
+               <p style="font-size:12px; margin:0; color:${pct <= 40 ? "var(--success-text)" : "var(--warning-text)"};">
+                 ${pct <= 40 ? "✓ Esta meta parece alcanzable." : "⚠ Puede ser difícil de sostener."}
+                 ${money(monthly)}/mes — un ${pct}% de tu disponible.
+               </p>
+             </div>`
+          : `<div class="card" style="text-align:center;"><p style="font-size:12px; color:var(--text-muted); margin:0;">Completá los campos para ver si es alcanzable</p></div>`
+        }
+
+        <div class="btn-row" style="margin-top:16px;">
+          <button class="btn-back" id="backBtn">‹</button>
+          <button class="btn-primary" id="finishBtn">Crear meta y terminar</button>
+        </div>
+      </div>
+    `;
+
+    ["gAmount", "gMonths"].forEach(id => {
+      document.getElementById(id).addEventListener("input", paint);
+    });
+    document.getElementById("gName").addEventListener("input", () => {}); // no repintar para no perder foco
+
+    document.getElementById("backBtn").addEventListener("click", () => renderOnboardingFixed());
+
+    document.getElementById("finishBtn").addEventListener("click", async () => {
+      const name = document.getElementById("gName").value.trim();
+      const errEl = document.getElementById("err");
+      if (!name || !target || !months) {
+        errEl.textContent = "Completá todos los campos.";
+        errEl.classList.add("visible");
+        return;
+      }
+      const { error } = await supabase.from("goals").insert({
+        user_id: user.id, name, target_amount: target, target_months: months,
+        linked_account_id: state.account.id, priority: "critical",
+      });
+      if (error) {
+        errEl.textContent = "No se pudo guardar. Intentá de nuevo.";
+        errEl.classList.add("visible");
+        return;
+      }
+      await loadState();
+      render();
+    });
+  }
+  paint();
+}
+
+// ---------------------------------------------------------------
+// APP PRINCIPAL (post-onboarding)
+// ---------------------------------------------------------------
+function renderApp() {
+  root.innerHTML = `
+    <div class="app-shell">
+      <div class="app-body" id="tabContent"></div>
+      <div class="bottom-nav">
+        <button class="nav-item ${tab === "inicio" ? "active" : ""}" data-tab="inicio"><span class="icon">🏠</span>Inicio</button>
+        <button class="nav-item ${tab === "coach" ? "active" : ""}" data-tab="coach"><span class="icon">💬</span>Coach</button>
+        <button class="nav-item ${tab === "simular" ? "active" : ""}" data-tab="simular"><span class="icon">🧮</span>Simular</button>
+        <button class="nav-item ${["mas","gastos","fijos","deudas","presup"].includes(tab) ? "active" : ""}" data-tab="mas"><span class="icon">☰</span>Más</button>
+      </div>
+    </div>
+    <div class="modal-overlay" id="logModal"></div>
+  `;
+
+  document.querySelectorAll(".nav-item").forEach(btn => {
+    btn.addEventListener("click", () => { tab = btn.dataset.tab; renderApp(); });
+  });
+
+  const logModal = document.getElementById("logModal");
+  logModal.addEventListener("click", (e) => {
+    if (e.target === logModal) { logModal.classList.remove("visible"); logModal.innerHTML = ""; }
+  });
+
+  const content = document.getElementById("tabContent");
+  if (tab === "inicio") content.innerHTML = tplInicio();
+  if (tab === "coach") content.innerHTML = tplCoach();
+  if (tab === "simular") content.innerHTML = tplSimular();
+  if (tab === "mas") content.innerHTML = tplMas();
+  if (tab === "gastos") content.innerHTML = backLink() + tplGastos();
+  if (tab === "metas") content.innerHTML = backLink() + tplMetas();
+  if (tab === "fijos") content.innerHTML = backLink() + tplFijos();
+  if (tab === "deudas") content.innerHTML = backLink() + tplDeudas();
+  if (tab === "presup") content.innerHTML = backLink() + tplPresupuestos();
+
+  wireTabEvents();
+  if (tab === "simular") wireSimulador();
+  if (tab === "coach") wireCoach();
+}
+
+function backLink() {
+  return `<button id="backToMas" style="background:none; color:var(--teal); font-size:13px; margin-bottom:14px; padding:0;">‹ Más</button>`;
+}
+
+function tplMas() {
+  const items = [
+    { tab: "gastos", icon: "🧾", label: "Gastos", desc: "Ver, editar y borrar tus movimientos" },
+    { tab: "metas", icon: "🎯", label: "Metas", desc: "Tus objetivos de ahorro" },
+    { tab: "fijos", icon: "💳", label: "Gastos fijos", desc: "Lo que se repite cada mes" },
+    { tab: "deudas", icon: "📄", label: "Deudas", desc: "Tarjetas, préstamos, financiamientos" },
+    { tab: "presup", icon: "📊", label: "Presupuestos", desc: "Límites por categoría" },
+  ];
+  return `
+    <h1 style="text-align:left; margin-bottom:14px;">Más</h1>
+    ${items.map(i => `
+      <button data-mas-item="${i.tab}" class="list-item" style="width:100%; text-align:left; cursor:pointer; padding:14px 12px;">
+        <span>${i.icon} <strong style="font-weight:500;">${i.label}</strong><br><span style="font-size:11px; color:var(--text-muted); margin-left:22px;">${i.desc}</span></span>
+        <span style="color:var(--text-muted);">›</span>
+      </button>
+    `).join("")}
+    <p style="text-align:center; margin-top:20px;"><button class="link-btn" id="logoutBtnMas" style="font-size:12px;">Cerrar sesión</button></p>
+  `;
+}
+
+let coachHistory = [];
+
+function tplCoach() {
+  return `
+    <p class="step-label" style="text-align:center; margin-bottom:10px;">Tu coach — basado en tus datos reales</p>
+    <div id="coachMessages" style="display:flex; flex-direction:column; gap:10px; max-height:320px; overflow-y:auto; margin-bottom:12px; padding-right:2px;">
+      ${coachHistory.length === 0 ? `
+        <div class="card accent">
+          <p style="font-size:12px; color:var(--teal); margin:0; line-height:1.5;">
+            Hola 👋 Preguntame lo que quieras sobre tu plata — tu disponible, tu meta, tus deudas. Respondo solo con tus datos reales.
+          </p>
+        </div>
+      ` : coachHistory.map(m => `
+        <div style="align-self:${m.role === "user" ? "flex-end" : "flex-start"}; background:${m.role === "user" ? "var(--teal)" : "var(--card)"}; color:${m.role === "user" ? "white" : "var(--text)"}; border-radius:14px; padding:10px 12px; max-width:85%;">
+          <p style="font-size:13px; margin:0; line-height:1.5;">${esc(m.content)}</p>
+        </div>
+      `).join("")}
+      <div id="coachTyping" style="display:none; align-self:flex-start; background:var(--card); border-radius:14px; padding:10px 12px;">
+        <p style="font-size:13px; margin:0; color:var(--text-muted);">Escribiendo…</p>
+      </div>
+    </div>
+    <div class="error-banner ${coachError ? "visible" : ""}" id="coachErr">${esc(coachError)}</div>
+    <div style="display:flex; gap:8px;">
+      <input id="coachInput" placeholder="Preguntale algo a tu coach" style="margin-bottom:0;" ${coachSending ? "disabled" : ""} />
+      <button class="btn-primary" id="coachSendBtn" style="flex:0 0 auto; padding:10px 16px;" ${coachSending ? "disabled" : ""}>${coachSending ? "…" : "Enviar"}</button>
+    </div>
+  `;
+}
+
+function buildCoachContext() {
+  const spentThisMonth = spentThisMonthTotal();
+  const goalMonthlyNeeded = state.goals.length > 0 ? Math.round(totalGoalMonthlyPace()) : null;
+
+  return {
+    balance: Math.round(balance()),
+    disponible: Math.round(disponible()),
+    spentThisMonth: Math.round(spentThisMonth),
+    income: Math.round(monthlyIncome()),
+    payFrequency: state.profile.pay_frequency,
+    totalFixed: Math.round(totalFixed()),
+    goalSummary: state.goals.length > 0
+      ? state.goals.map(g => `"${g.name}" (RD$${g.current_amount} de RD$${g.target_amount}, ${g.target_months} meses)`).join("; ")
+      : null,
+    goalCount: state.goals.length,
+    goalMonthlyNeeded,
+    debtsSummary: state.debts.length > 0
+      ? state.debts.map(d => `${d.name}: debe RD$${d.current_balance}`).join("; ")
+      : null,
+  };
+}
+
+let coachError = "";
+let coachSending = false;
+
+async function sendCoachMessage() {
+  if (coachSending) return; // evita envíos duplicados por doble Enter/clic
+  const input = document.getElementById("coachInput");
+  const msg = input.value.trim();
+  if (!msg) return;
+
+  coachError = "";
+  coachSending = true;
+  coachHistory.push({ role: "user", content: msg });
+  input.value = "";
+  renderApp();
+  const typingEl = document.getElementById("coachTyping");
+  if (typingEl) typingEl.style.display = "block";
+  const msgsEl = document.getElementById("coachMessages");
+  if (msgsEl) msgsEl.scrollTop = msgsEl.scrollHeight;
+
+  try {
+    const { data, error } = await supabase.functions.invoke("coach-chat", {
+      body: {
+        message: msg,
+        history: coachHistory.slice(0, -1).slice(-10),
+        context: buildCoachContext(),
+      },
+    });
+    if (error || data?.error) throw new Error(data?.error || error.message);
+    coachHistory.push({ role: "assistant", content: data.reply });
+  } catch (e) {
+    coachError = "No se pudo conectar con el coach. Revisá tu conexión e intentá de nuevo.";
+  } finally {
+    coachSending = false;
+  }
+  renderApp();
+}
+
+function wireCoach() {
+  const sendBtn = document.getElementById("coachSendBtn");
+  const input = document.getElementById("coachInput");
+  if (!sendBtn) return;
+  sendBtn.addEventListener("click", sendCoachMessage);
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") sendCoachMessage(); });
+  const msgs = document.getElementById("coachMessages");
+  if (msgs) msgs.scrollTop = msgs.scrollHeight;
+}
+
+function tplSimular() {
+  const goalLabel = state.goals.length === 0 ? null
+    : state.goals.length === 1 ? `Impacto en "${state.goals[0].name}"`
+    : `Impacto en tus ${state.goals.length} metas`;
+  return `
+    <h1 style="text-align:center; margin-bottom:14px;">¿Qué pasa si compro esto?</h1>
+    <div class="card" id="simCard">
+      <label style="text-align:center; display:block;">¿En qué? <span style="color:var(--text-muted);">(opcional)</span></label>
+      <input type="text" id="simItemName" placeholder="Ej. Tenis, salir a comer, un regalo" style="text-align:center; margin-bottom:14px;" />
+
+      <div style="display:flex; align-items:center; justify-content:center; gap:6px; margin-bottom:6px;">
+        <span style="font-size:28px; font-weight:600; color:var(--teal);">RD$</span>
+        <input type="number" id="simAmountInput" value="1000" style="font-size:28px; font-weight:600; color:var(--teal); text-align:center; width:140px; border:none; padding:2px; margin-bottom:0;" />
+      </div>
+      <input type="range" id="simSlider" min="0" max="${Math.max(disponible() * 2, 3000)}" step="50" value="1000" style="width:100%; margin-bottom:16px;" />
+      <div class="row-between" style="background:white; border-radius:10px; padding:10px 12px; margin-bottom:8px;">
+        <span style="font-size:12px; color:var(--text-secondary);">Saldo real ahora</span>
+        <span style="font-size:12px; font-weight:500;">${money(balance())}</span>
+      </div>
+      <div class="row-between" style="background:white; border-radius:10px; padding:10px 12px; margin-bottom:8px;">
+        <span style="font-size:12px; color:var(--text-secondary);">Disponible este mes</span>
+        <span style="font-size:12px; font-weight:500;">${money(disponible())}</span>
+      </div>
+      <div class="row-between" style="background:white; border-radius:10px; padding:10px 12px; margin-bottom:8px;">
+        <span style="font-size:12px; color:var(--text-secondary);">Ya gastaste este mes</span>
+        <span style="font-size:12px; font-weight:500;">${money(spentThisMonthTotal())}</span>
+      </div>
+      <div class="row-between" style="background:white; border-radius:10px; padding:10px 12px;">
+        <span style="font-size:12px; color:var(--text-secondary);">Te quedaría (según tu plan)</span>
+        <span id="simRemaining" style="font-size:12px; font-weight:500;">${money(disponible() - spentThisMonthTotal() - 1000)}</span>
+      </div>
+      <div id="simBalanceWarning" style="display:none;"></div>
+      ${goalLabel ? `
+        <div class="row-between" style="background:white; border-radius:10px; padding:10px 12px; margin-top:8px;">
+          <span style="font-size:12px; color:var(--text-secondary);">${goalLabel}</span>
+          <span id="simGoalImpact" style="font-size:12px; font-weight:500;"></span>
+        </div>
+      ` : ""}
+    </div>
+    <button id="askCoachBtn" class="btn-secondary" style="width:100%; margin-top:12px;">💬 Preguntarle al coach sobre esto</button>
+    <p style="font-size:11px; color:var(--text-muted); text-align:center; margin-top:10px;">El slider es un cálculo instantáneo tuyo. El coach lo interpreta cuando se lo pedís.</p>
+  `;
+}
+
+function wireSimulador() {
+  const slider = document.getElementById("simSlider");
+  const amountInput = document.getElementById("simAmountInput");
+  if (!slider) return;
+  const monthlyGoalContribution = totalGoalMonthlyPace();
+  const alreadySpent = spentThisMonthTotal();
+  const sliderMax = Number(slider.max);
+
+  function update(val) {
+    val = Math.max(0, Number(val) || 0);
+    slider.value = Math.min(val, sliderMax);
+    amountInput.value = val;
+
+    const remaining = disponible() - alreadySpent - val;
+    const remainingEl = document.getElementById("simRemaining");
+    remainingEl.textContent = money(remaining);
+    remainingEl.style.color = remaining < 0 ? "var(--danger-text)" : "inherit";
+
+    const impactEl = document.getElementById("simGoalImpact");
+    if (impactEl) {
+      if (remaining >= monthlyGoalContribution || monthlyGoalContribution === 0) {
+        impactEl.textContent = "Sin cambios";
+        impactEl.style.color = "var(--success-text)";
+      } else {
+        const shortfall = monthlyGoalContribution - Math.max(0, remaining);
+        const extraMonths = Math.ceil(shortfall / monthlyGoalContribution);
+        impactEl.textContent = `+${extraMonths} mes${extraMonths > 1 ? "es" : ""} de retraso`;
+        impactEl.style.color = "var(--warning-text)";
+      }
+    }
+
+    const warnEl = document.getElementById("simBalanceWarning");
+    if (balance() < val) {
+      warnEl.style.display = "flex";
+      warnEl.style.gap = "8px";
+      warnEl.style.background = "var(--danger-bg)";
+      warnEl.style.borderRadius = "10px";
+      warnEl.style.padding = "10px 12px";
+      warnEl.style.marginTop = "8px";
+      warnEl.innerHTML = `<span>⚠️</span><p style="font-size:12px; color:var(--danger-text); margin:0; line-height:1.5;">Aunque tu plan mensual lo permite, hoy no tenés ${money(val)} en tu cuenta real (tenés ${money(balance())}). No podrías hacer esta compra en este momento.</p>`;
+    } else {
+      warnEl.style.display = "none";
+    }
+  }
+
+  slider.addEventListener("input", () => update(slider.value));
+  amountInput.addEventListener("input", () => update(amountInput.value));
+  update(1000);
+
+  const askCoachBtn = document.getElementById("askCoachBtn");
+  if (askCoachBtn) askCoachBtn.addEventListener("click", () => {
+    const amount = Number(amountInput.value);
+    const itemName = document.getElementById("simItemName").value.trim();
+    const thing = itemName ? `en ${itemName}` : "en algo";
+    let msg = `Estoy pensando en gastar ${money(amount)} ${thing}. Ya gasté ${money(alreadySpent)} este mes, así que con esto me quedarían ${money(disponible() - alreadySpent - amount)} de disponible.`;
+    if (state.goals.length === 1) msg += ` ¿Cómo afecta esto a mi meta "${state.goals[0].name}"?`;
+    else if (state.goals.length > 1) msg += ` ¿Cómo afecta esto a mis metas (${state.goals.map(gl => gl.name).join(", ")})?`;
+    msg += " ¿Qué opinás?";
+    tab = "coach";
+    renderApp();
+    const input = document.getElementById("coachInput");
+    if (input) {
+      input.value = msg;
+      input.focus();
+      input.setSelectionRange(0, 0);
+      input.scrollLeft = 0;
+    }
+  });
+}
+
+function primaryGoal() {
+  const order = { critical: 0, important: 1, optional: 2 };
+  return [...state.goals].sort((a, b) => (order[a.priority] ?? 3) - (order[b.priority] ?? 3))[0];
+}
+
+function tplInicio() {
+  const g = primaryGoal();
+  const progressPct = g ? Math.min(100, Math.round((Number(g.current_amount) / Number(g.target_amount)) * 100)) : 0;
+  const baseline = computeBaselineScore();
+  return `
+    <div class="top-bar">
+      <div>
+        <p class="name">Hola</p>
+        <p class="date">${new Date().toLocaleDateString("es-DO", { weekday: "long", day: "numeric", month: "long" })}</p>
+      </div>
+      <div class="avatar">👤</div>
+    </div>
+
+    <div class="score-grid">
+      <div class="score-box">
+        <p class="label">Situación</p>
+        <p class="value" style="color:var(--teal);">${baseline !== null ? baseline : "—"}</p>
+        <p style="font-size:10px; color:var(--text-muted); margin:4px 0 0;">Según tu ingreso, deuda y ahorro</p>
+      </div>
+      <div class="score-box">
+        <p class="label">Hábitos</p>
+        <p class="value">Aprendiendo</p>
+        <p style="font-size:10px; color:var(--text-muted); margin:4px 0 0;">Necesitamos más datos tuyos</p>
+      </div>
+    </div>
+
+    <div class="card row-between" style="margin-bottom:10px; ${balance() < 0 ? 'background:var(--danger-bg);' : ''}">
+      <span style="font-size:12px; color:${balance() < 0 ? 'var(--danger-text)' : 'var(--text-secondary)'};">
+        ${balance() < 0 ? '⚠ Saldo en negativo' : 'Saldo en cuenta'}
+      </span>
+      <span style="font-weight:600; color:${balance() < 0 ? 'var(--danger-text)' : 'var(--teal)'};">${money(balance())}</span>
+    </div>
+
+    ${g ? `
+      <div class="card">
+        <div class="row-between" style="margin-bottom:6px;">
+          <span style="font-weight:500;">${esc(g.name)}</span>
+          <span class="badge ${g.priority}">${g.priority === "critical" ? "Crítica" : g.priority === "important" ? "Importante" : "Opcional"}</span>
+        </div>
+        <p style="font-size:11px; color:var(--text-muted); margin:0 0 6px;">${money(g.current_amount)} de ${money(g.target_amount)} · ${g.target_months} meses</p>
+        <div class="progress-bar"><div class="progress-fill" style="width:${progressPct}%;"></div></div>
+      </div>
+      ${state.goals.length > 1 ? `<p style="font-size:11px; color:var(--text-muted); margin:-4px 0 10px; text-align:center;">+${state.goals.length - 1} meta${state.goals.length > 2 ? "s" : ""} más en "Más → Metas"</p>` : ""}
+    ` : ""}
+
+    <div class="card accent" style="display:flex; gap:8px;">
+      <span>ℹ️</span>
+      <p style="font-size:12px; color:var(--teal); margin:0; line-height:1.5;">
+        ${state.profile.pay_frequency === "monthly"
+          ? "Cobrás a fin de mes, así que no esperes ver aportes hasta entonces."
+          : "Cobrás quincenal, tu primer aporte puede llegar antes de fin de mes."}
+      </p>
+    </div>
+
+    <button class="fab" id="openLogBtn">+ Registrar gasto</button>
+    <button class="btn-secondary" id="openIncomeBtn" style="width:100%; margin-top:-8px; margin-bottom:16px;">+ Registrar ingreso</button>
+    <p style="text-align:center; margin-top:-8px;"><button class="link-btn" id="logoutBtn" style="font-size:11px;">Cerrar sesión</button></p>
+  `;
+}
+
+function tplGastos() {
+  const quickButtons = `
+    <div class="btn-row" style="margin-bottom:14px;">
+      <button class="btn-secondary" id="gastosAddExpenseBtn" style="flex:1;">+ Gasto</button>
+      <button class="btn-secondary" id="gastosAddIncomeBtn" style="flex:1;">+ Ingreso</button>
+    </div>
+  `;
+  if (state.transactions.length === 0) {
+    return `<div class="empty-state"><div class="icon-circle">🧾</div><p style="font-size:13px; color:var(--text-muted);">Todavía no registraste ningún movimiento.</p></div>${quickButtons}`;
+  }
+  const visibles = state.transactions.slice(0, 50);
+  const hayMas = state.transactions.length > 50;
+  return `
+    <h1 style="text-align:left; margin-bottom:14px;">Tus gastos</h1>
+    ${quickButtons}
+    ${visibles.map(t => {
+      const isIncome = Number(t.amount) > 0;
+      const label = isIncome
+        ? (t.note || "Ingreso")
+        : (t.categories?.name || t.note || "Sin categoría");
+      const icon = isIncome ? "💰" : (t.categories?.name ? (CATEGORY_ICONS[t.categories.name] || "•") : "📄");
+      return `
+      <div class="list-item">
+        <span>${icon} ${esc(label)}
+          <span style="color:var(--text-muted); font-size:11px;"> · ${new Date(t.occurred_at).toLocaleDateString("es-DO", { day: "numeric", month: "short" })}</span>
+        </span>
+        <span style="display:flex; align-items:center; gap:10px;">
+          <span style="color:${isIncome ? 'var(--success-text)' : 'inherit'};">${isIncome ? "+" : "-"}${money(Math.abs(t.amount))}</span>
+          <span class="actions">
+            ${!isIncome ? `<button data-edit-tx="${t.id}">✎</button>` : ""}
+            <button data-del-tx="${t.id}">✕</button>
+          </span>
+        </span>
+      </div>
+    `;
+    }).join("")}
+    ${hayMas ? `<p style="font-size:11px; color:var(--text-muted); text-align:center; margin-top:10px;">Mostrando los 50 más recientes de ${state.transactions.length}. El saldo suma todos.</p>` : ""}
+  `;
+}
+
+function tplMetas() {
+  const list = state.goals.map(g => {
+    const progressPct = Math.min(100, Math.round((Number(g.current_amount) / Number(g.target_amount)) * 100));
+    const monthly = goalMonthlyPace(g);
+    const priorityLabel = g.priority === "critical" ? "Crítica" : g.priority === "important" ? "Importante" : "Opcional";
+    return `
+      <div class="card">
+        <div class="row-between" style="margin-bottom:6px;">
+          <span style="font-weight:500;">${esc(g.name)}</span>
+          <div style="display:flex; gap:6px; align-items:center;">
+            <span class="badge ${g.priority}">${priorityLabel}</span>
+            <button data-edit-goal="${g.id}" style="background:none; color:var(--text-muted); font-size:12px;">✎</button>
+            <button data-del-goal="${g.id}" style="background:none; color:var(--text-muted); font-size:12px;">✕</button>
+          </div>
+        </div>
+        <p style="font-size:11px; color:var(--text-muted); margin:0 0 6px;">${money(g.current_amount)} de ${money(g.target_amount)} · ${g.target_months} meses</p>
+        <div class="progress-bar"><div class="progress-fill" style="width:${progressPct}%;"></div></div>
+        <p style="font-size:11px; color:var(--text-muted); margin:8px 0 0;">Aporte mensual necesario: ${money(monthly)}</p>
+      </div>
+    `;
+  }).join("");
+
+  return `
+    <h1 style="text-align:left; margin-bottom:14px;">Tus metas</h1>
+    ${state.goals.length === 0
+      ? `<div class="empty-state"><div class="icon-circle">🎯</div><p style="font-size:13px; color:var(--text-muted);">Todavía no creaste ninguna meta.</p></div>`
+      : list
+    }
+    <div style="margin-top:14px;">
+      <input id="newGName" placeholder="Ej. Laptop nueva" style="margin-bottom:8px;" />
+      <input id="newGAmount" type="number" placeholder="Monto objetivo" style="margin-bottom:8px;" />
+      <input id="newGMonths" type="number" placeholder="¿En cuántos meses?" style="margin-bottom:8px;" />
+      <button class="btn-secondary" id="addGoalBtn" style="width:100%;">+ Agregar meta</button>
+    </div>
+  `;
+}
+
+function tplFijos() {
+  if (state.fixed.length === 0) {
+    return `<div class="empty-state"><div class="icon-circle">💳</div><p style="font-size:13px; color:var(--text-muted);">Todavía no agregaste gastos fijos.</p></div>
+      ${fixedAddForm()}`;
+  }
+  return `
+    <h1 style="text-align:left; margin-bottom:4px;">Tus gastos fijos</h1>
+    <p style="font-size:11px; color:var(--text-muted); margin:0 0 14px;">No son deudas — no tienen saldo pendiente.</p>
+    ${state.fixed.map(f => `
+      <div class="list-item">
+        <span>${CATEGORY_ICONS[f.categories?.name] || "•"} ${esc(f.name)}</span>
+        <span style="display:flex; align-items:center; gap:10px;">
+          ${money(f.estimated_amount)}
+          <span class="actions">
+            <button data-edit-fixed="${f.id}">✎</button>
+            <button data-del-fixed="${f.id}">✕</button>
+          </span>
+        </span>
+      </div>
+    `).join("")}
+    <div class="card accent" style="margin-top:8px;">
+      <div class="row-between"><span style="font-size:12px; font-weight:500; color:var(--teal);">Total fijo mensual</span><span style="font-weight:600; color:var(--teal);">${money(totalFixed())}</span></div>
+    </div>
+    ${fixedAddForm()}
+  `;
+}
+
+function fixedAddForm() {
+  return `
+    <div style="margin-top:14px;">
+      <input id="newFName" placeholder="Ej. Netflix" style="margin-bottom:8px;" />
+      <label>Categoría</label>
+      <select id="newFCat" style="margin-bottom:8px;">
+        <option value="" selected>Elegí una categoría</option>
+        ${categories.map(c => `<option value="${c.id}">${c.name}</option>`).join("")}
+      </select>
+      <input id="newFAmount" type="number" placeholder="RD$0" style="margin-bottom:8px;" />
+      <button class="btn-secondary" id="addFixedTabBtn" style="width:100%;">+ Agregar gasto fijo</button>
+    </div>
+  `;
+}
+
+function tplDeudas() {
+  if (state.debts.length === 0) {
+    return `<div class="empty-state"><div class="icon-circle">📄</div><p style="font-size:13px; color:var(--text-muted);">No tenés deudas registradas.</p></div>
+      ${debtAddForm()}`;
+  }
+  return `
+    <h1 style="text-align:left; margin-bottom:14px;">Tus deudas</h1>
+    ${state.debts.map(d => {
+      const paid = Number(d.original_amount) - Number(d.current_balance);
+      const pct = d.original_amount > 0 ? Math.round((paid / Number(d.original_amount)) * 100) : 0;
+      const isPaidOff = Number(d.current_balance) <= 0;
+      const typeInfo = DEBT_TYPES.find(t => t.value === d.debt_type);
+      return `
+      <div class="card">
+        <div class="row-between" style="margin-bottom:6px;">
+          <span style="font-weight:500;">${typeInfo ? typeInfo.icon : "📄"} ${esc(d.name)}</span>
+          <div style="display:flex; gap:6px;">
+            <button data-edit-debt="${d.id}" style="background:none; color:var(--text-muted); font-size:12px;">✎</button>
+            <button data-del-debt="${d.id}" style="background:none; color:var(--text-muted); font-size:12px;">✕</button>
+          </div>
+        </div>
+        <p style="font-size:11px; color:var(--text-muted); margin:0 0 6px;">
+          ${typeInfo ? typeInfo.label : "Otro"}${d.interest_rate ? ` · ${d.interest_rate}% anual` : ""}
+        </p>
+        ${isPaidOff
+          ? `<p style="font-size:13px; font-weight:600; color:var(--success-text); margin:0 0 4px;">✓ Deuda pagada</p>`
+          : `<p style="font-size:15px; font-weight:600; color:var(--teal); margin:0 0 4px;">Debés ${money(d.current_balance)}</p>`
+        }
+        <p style="font-size:11px; color:var(--text-muted); margin:0 0 6px;">Pagaste ${money(paid)} de ${money(d.original_amount)}</p>
+        <div class="progress-bar"><div class="progress-fill" style="width:${pct}%;"></div></div>
+        ${!isPaidOff ? `
+          <div class="row-between" style="margin-top:8px;">
+            ${d.minimum_payment ? `<span style="font-size:11px; color:var(--text-muted);">Cuota sugerida: ${money(d.minimum_payment)}</span>` : `<span></span>`}
+            <button data-pay-debt="${d.id}" class="btn-secondary" style="padding:6px 12px; font-size:12px;">Registrar pago</button>
+          </div>
+        ` : ""}
+      </div>
+    `;
+    }).join("")}
+    ${debtAddForm()}
+  `;
+}
+
+function debtAddForm() {
+  return `
+    <div style="margin-top:14px;">
+      <input id="newDName" placeholder="Ej. Tarjeta Banco X" style="margin-bottom:8px;" />
+      <label>Tipo de deuda</label>
+      <select id="newDType" style="margin-bottom:8px;">
+        <option value="" selected>Elegí un tipo</option>
+        ${DEBT_TYPES.map(t => `<option value="${t.value}">${t.icon} ${t.label}</option>`).join("")}
+      </select>
+      <input id="newDAmount" type="number" placeholder="Monto total de la deuda" style="margin-bottom:8px;" />
+      <label>Tasa de interés anual <span style="color:var(--text-muted);">(opcional, en %)</span></label>
+      <input id="newDInterest" type="number" placeholder="Ej. 45" style="margin-bottom:8px;" />
+      <label>¿En cuántas cuotas planeás pagarla? <span style="color:var(--text-muted);">(opcional)</span></label>
+      <input id="newDInstallments" type="number" placeholder="Ej. 10" style="margin-bottom:8px;" />
+      <button class="btn-secondary" id="addDebtBtn" style="width:100%;">+ Agregar deuda</button>
+    </div>
+  `;
+}
+
+function tplPresupuestos() {
+  return `
+    <h1 style="text-align:left; margin-bottom:4px;">Tus presupuestos</h1>
+    <p style="font-size:11px; color:var(--text-muted); margin:0 0 14px;">Cuánto planeás gastar por categoría este mes.</p>
+    ${categories.map(c => {
+      const budget = state.budgets.find(b => b.category_id === c.id);
+      const spent = spentThisMonthByCategory(c.id);
+      const pct = budget ? Math.min(100, Math.round((spent / Number(budget.amount)) * 100)) : 0;
+      return `
+        <div class="card">
+          <div class="row-between" style="margin-bottom:6px;">
+            <span>${CATEGORY_ICONS[c.name] || "•"} ${c.name}</span>
+            ${budget
+              ? `<button data-remove-budget="${budget.id}" style="background:none; color:var(--text-muted); font-size:12px;">✕</button>`
+              : ""}
+          </div>
+          ${budget ? `
+            <p style="font-size:11px; color:var(--text-muted); margin:0 0 6px;">${money(spent)} de ${money(budget.amount)} este mes</p>
+            <div class="progress-bar"><div class="progress-fill" style="width:${pct}%; background:${pct >= 100 ? 'var(--danger-text)' : 'var(--gold)'};"></div></div>
+            <div style="display:flex; gap:6px; margin-top:8px;">
+              <input type="number" placeholder="Nuevo monto" id="budgetEditInput-${c.id}" style="margin-bottom:0;" />
+              <button data-update-budget="${budget.id}" data-update-cat="${c.id}" class="btn-secondary" style="white-space:nowrap;">Actualizar</button>
+            </div>
+          ` : `
+            <div style="display:flex; gap:6px;">
+              <input type="number" placeholder="RD$0" id="budgetInput-${c.id}" style="margin-bottom:0;" />
+              <button data-set-budget="${c.id}" class="btn-secondary" style="white-space:nowrap;">Fijar</button>
+            </div>
+          `}
+        </div>
+      `;
+    }).join("")}
+  `;
+}
+
+// ---------------------------------------------------------------
+// EVENTOS DE LAS PESTAÑAS
+// ---------------------------------------------------------------
+function wireTabEvents() {
+  const openLogBtn = document.getElementById("openLogBtn");
+  if (openLogBtn) openLogBtn.addEventListener("click", openLogModal);
+
+  const openIncomeBtn = document.getElementById("openIncomeBtn");
+  if (openIncomeBtn) openIncomeBtn.addEventListener("click", openIncomeModal);
+
+  const gastosAddExpenseBtn = document.getElementById("gastosAddExpenseBtn");
+  if (gastosAddExpenseBtn) gastosAddExpenseBtn.addEventListener("click", openLogModal);
+
+  const gastosAddIncomeBtn = document.getElementById("gastosAddIncomeBtn");
+  if (gastosAddIncomeBtn) gastosAddIncomeBtn.addEventListener("click", openIncomeModal);
+
+  const logoutBtn = document.getElementById("logoutBtn");
+  if (logoutBtn) logoutBtn.addEventListener("click", async () => {
+    await supabase.auth.signOut();
+    window.location.href = "index.html";
+  });
+
+  const logoutBtnMas = document.getElementById("logoutBtnMas");
+  if (logoutBtnMas) logoutBtnMas.addEventListener("click", async () => {
+    await supabase.auth.signOut();
+    window.location.href = "index.html";
+  });
+
+  const backToMas = document.getElementById("backToMas");
+  if (backToMas) backToMas.addEventListener("click", () => { tab = "mas"; renderApp(); });
+
+  document.querySelectorAll("[data-mas-item]").forEach(btn => {
+    btn.addEventListener("click", () => { tab = btn.dataset.masItem; renderApp(); });
+  });
+
+  const addGoalBtn = document.getElementById("addGoalBtn");
+  if (addGoalBtn) addGoalBtn.addEventListener("click", async () => {
+    const name = document.getElementById("newGName").value.trim();
+    const amount = document.getElementById("newGAmount").value;
+    const months = document.getElementById("newGMonths").value;
+    if (!name || !amount || !months) { alert("Completá el nombre, el monto y el plazo."); return; }
+    const { error } = await supabase.from("goals").insert({
+      user_id: user.id, name, target_amount: Number(amount), target_months: Number(months),
+      linked_account_id: state.account.id, priority: "important",
+    });
+    if (error) { alert("No se pudo guardar. Intentá de nuevo."); return; }
+    await loadState(); renderApp();
+  });
+
+  document.querySelectorAll("[data-del-goal]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      if (!(await confirmAction("¿Borrar esta meta?"))) return;
+      await supabase.from("goals").delete().eq("id", btn.dataset.delGoal);
+      await loadState(); renderApp();
+    });
+  });
+
+  document.querySelectorAll("[data-edit-goal]").forEach(btn => {
+    btn.addEventListener("click", () => openEditGoalModal(btn.dataset.editGoal));
+  });
+
+  document.querySelectorAll("[data-del-fixed]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      if (!(await confirmAction("¿Borrar este gasto fijo?"))) return;
+      await supabase.from("recurring_expense_templates").delete().eq("id", btn.dataset.delFixed);
+      await loadState(); renderApp();
+    });
+  });
+
+  const addFixedTabBtn = document.getElementById("addFixedTabBtn");
+  if (addFixedTabBtn) addFixedTabBtn.addEventListener("click", async () => {
+    const name = document.getElementById("newFName").value.trim();
+    const catId = document.getElementById("newFCat").value;
+    const amount = document.getElementById("newFAmount").value;
+    if (!name || !catId || !amount) { alert("Completá el nombre, la categoría y el monto."); return; }
+    const { error } = await supabase.from("recurring_expense_templates").insert({
+      user_id: user.id, name, category_id: catId, estimated_amount: Number(amount),
+    });
+    if (error) { alert("No se pudo guardar. Intentá de nuevo."); return; }
+    await loadState(); renderApp();
+  });
+
+  document.querySelectorAll("[data-del-debt]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      if (!(await confirmAction("¿Borrar esta deuda?"))) return;
+      await supabase.from("debts").delete().eq("id", btn.dataset.delDebt);
+      await loadState(); renderApp();
+    });
+  });
+
+  document.querySelectorAll("[data-edit-debt]").forEach(btn => {
+    btn.addEventListener("click", () => openEditDebtModal(btn.dataset.editDebt));
+  });
+
+  document.querySelectorAll("[data-edit-fixed]").forEach(btn => {
+    btn.addEventListener("click", () => openEditFixedModal(btn.dataset.editFixed));
+  });
+
+  document.querySelectorAll("[data-del-tx]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      if (!(await confirmAction("¿Borrar este gasto?"))) return;
+      await supabase.from("transactions").delete().eq("id", btn.dataset.delTx);
+      await loadState(); renderApp();
+    });
+  });
+
+  document.querySelectorAll("[data-edit-tx]").forEach(btn => {
+    btn.addEventListener("click", () => openEditTxModal(btn.dataset.editTx));
+  });
+
+  document.querySelectorAll("[data-update-budget]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const catId = btn.dataset.updateCat;
+      const oldBudgetId = btn.dataset.updateBudget;
+      const input = document.getElementById(`budgetEditInput-${catId}`);
+      const amount = input.value;
+      if (!amount || Number(amount) <= 0) { alert("Poné un monto válido."); return; }
+      const today = new Date().toISOString().slice(0, 10);
+      const { error: closeError } = await supabase.from("budgets").update({ effective_to: today }).eq("id", oldBudgetId);
+      if (closeError) { alert("No se pudo actualizar. Intentá de nuevo."); return; }
+      const { error: insertError } = await supabase.from("budgets").insert({
+        user_id: user.id, category_id: catId, amount: Number(amount), effective_from: today,
+      });
+      if (insertError) { alert("No se pudo actualizar. Intentá de nuevo."); return; }
+      await loadState(); renderApp();
+    });
+  });
+
+  document.querySelectorAll("[data-set-budget]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const catId = btn.dataset.setBudget;
+      const input = document.getElementById(`budgetInput-${catId}`);
+      const amount = input.value;
+      if (!amount || Number(amount) <= 0) { alert("Poné un monto válido."); return; }
+      const { error } = await supabase.from("budgets").insert({
+        user_id: user.id, category_id: catId, amount: Number(amount), effective_from: new Date().toISOString().slice(0, 10),
+      });
+      if (error) { alert("No se pudo guardar. Intentá de nuevo."); return; }
+      await loadState(); renderApp();
+    });
+  });
+
+  document.querySelectorAll("[data-remove-budget]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      if (!(await confirmAction("¿Quitar este presupuesto? Podés fijar uno nuevo cuando quieras."))) return;
+      await supabase.from("budgets").update({ effective_to: new Date().toISOString().slice(0, 10) }).eq("id", btn.dataset.removeBudget);
+      await loadState(); renderApp();
+    });
+  });
+
+  const addDebtBtn = document.getElementById("addDebtBtn");
+  if (addDebtBtn) addDebtBtn.addEventListener("click", async () => {
+    const name = document.getElementById("newDName").value.trim();
+    const debtType = document.getElementById("newDType").value;
+    const amount = document.getElementById("newDAmount").value;
+    const interest = document.getElementById("newDInterest").value;
+    const installments = document.getElementById("newDInstallments").value;
+    if (!name || !debtType || !amount) { alert("Completá el nombre, el tipo y el monto."); return; }
+    const minimumPayment = installments && Number(installments) > 0
+      ? Number(amount) / Number(installments)
+      : null;
+    const { error } = await supabase.from("debts").insert({
+      user_id: user.id, name, debt_type: debtType,
+      original_amount: Number(amount), current_balance: Number(amount),
+      interest_rate: interest ? Number(interest) : null,
+      minimum_payment: minimumPayment,
+    });
+    if (error) { alert("No se pudo guardar. Intentá de nuevo."); return; }
+    await loadState(); renderApp();
+  });
+
+  document.querySelectorAll("[data-pay-debt]").forEach(btn => {
+    btn.addEventListener("click", () => openPayDebtModal(btn.dataset.payDebt));
+  });
+}
+
+// ---------------------------------------------------------------
+// MODAL: EDITAR DEUDA (nombre, tipo, tasa — no el saldo, eso solo
+// cambia registrando un pago, para no perder el rastro de auditoría)
+// ---------------------------------------------------------------
+function openEditDebtModal(debtId) {
+  const d = state.debts.find(x => x.id === debtId);
+  const modal = document.getElementById("logModal");
+  modal.classList.add("visible");
+  modal.innerHTML = `
+    <div class="modal-box">
+      <p class="step-label">Editar deuda</p>
+      <label>Nombre</label>
+      <input id="edName" value="${esc(d.name)}" style="margin-bottom:10px;" />
+      <label>Tipo de deuda</label>
+      <select id="edType" style="margin-bottom:10px;">
+        ${DEBT_TYPES.map(t => `<option value="${t.value}" ${d.debt_type === t.value ? "selected" : ""}>${t.icon} ${t.label}</option>`).join("")}
+      </select>
+      <label>Tasa de interés anual (%)</label>
+      <input id="edInterest" type="number" value="${d.interest_rate ?? ""}" style="margin-bottom:16px;" />
+      <div class="btn-row">
+        <button class="btn-secondary" id="cancelEditDebt">Cancelar</button>
+        <button class="btn-primary" id="saveEditDebt">Guardar</button>
+      </div>
+    </div>
+  `;
+  document.getElementById("cancelEditDebt").addEventListener("click", () => { modal.classList.remove("visible"); modal.innerHTML = ""; });
+  document.getElementById("saveEditDebt").addEventListener("click", async () => {
+    const name = document.getElementById("edName").value.trim();
+    const debtType = document.getElementById("edType").value;
+    const interest = document.getElementById("edInterest").value;
+    if (!name) { alert("El nombre no puede quedar vacío."); return; }
+    await supabase.from("debts").update({
+      name, debt_type: debtType, interest_rate: interest ? Number(interest) : null,
+    }).eq("id", debtId);
+    modal.classList.remove("visible"); modal.innerHTML = "";
+    await loadState(); renderApp();
+    showToast("Deuda actualizada");
+  });
+}
+
+// ---------------------------------------------------------------
+// MODAL: EDITAR GASTO FIJO
+// ---------------------------------------------------------------
+function openEditFixedModal(fixedId) {
+  const f = state.fixed.find(x => x.id === fixedId);
+  const modal = document.getElementById("logModal");
+  modal.classList.add("visible");
+  modal.innerHTML = `
+    <div class="modal-box">
+      <p class="step-label">Editar gasto fijo</p>
+      <label>Nombre</label>
+      <input id="efName" value="${esc(f.name)}" style="margin-bottom:10px;" />
+      <label>Categoría</label>
+      <select id="efCat" style="margin-bottom:10px;">
+        ${categories.map(c => `<option value="${c.id}" ${f.category_id === c.id ? "selected" : ""}>${c.name}</option>`).join("")}
+      </select>
+      <label>Monto mensual</label>
+      <input id="efAmount" type="number" value="${f.estimated_amount}" style="margin-bottom:16px;" />
+      <div class="btn-row">
+        <button class="btn-secondary" id="cancelEditFixed">Cancelar</button>
+        <button class="btn-primary" id="saveEditFixed">Guardar</button>
+      </div>
+    </div>
+  `;
+  document.getElementById("cancelEditFixed").addEventListener("click", () => { modal.classList.remove("visible"); modal.innerHTML = ""; });
+  document.getElementById("saveEditFixed").addEventListener("click", async () => {
+    const name = document.getElementById("efName").value.trim();
+    const catId = document.getElementById("efCat").value;
+    const amount = document.getElementById("efAmount").value;
+    if (!name || !amount) { alert("Completá el nombre y el monto."); return; }
+    await supabase.from("recurring_expense_templates").update({
+      name, category_id: catId, estimated_amount: Number(amount),
+    }).eq("id", fixedId);
+    modal.classList.remove("visible"); modal.innerHTML = "";
+    await loadState(); renderApp();
+    showToast("Gasto fijo actualizado");
+  });
+}
+
+// ---------------------------------------------------------------
+// MODAL: EDITAR TRANSACCIÓN
+// ---------------------------------------------------------------
+function openEditTxModal(txId) {
+  const t = state.transactions.find(x => x.id === txId);
+  const modal = document.getElementById("logModal");
+  let selectedCat = t.category_id;
+
+  function paint() {
+    modal.classList.add("visible");
+    modal.innerHTML = `
+      <div class="modal-box">
+        <p class="step-label">Editar gasto</p>
+        <input id="etAmount" type="number" value="${Math.abs(t.amount)}" style="text-align:center; font-size:24px; margin-bottom:14px;" />
+        <label>Categoría</label>
+        <div class="cat-grid">
+          ${categories.map(c => `<div class="cat-option ${selectedCat === c.id ? "selected" : ""}" data-cat="${c.id}">${CATEGORY_ICONS[c.name] || "•"}<br>${c.name}</div>`).join("")}
+        </div>
+        <div class="btn-row">
+          <button class="btn-secondary" id="cancelEditTx">Cancelar</button>
+          <button class="btn-primary" id="saveEditTx">Guardar</button>
+        </div>
+      </div>
+    `;
+    document.querySelectorAll(".cat-option").forEach(el => {
+      el.addEventListener("click", () => { selectedCat = el.dataset.cat; paint(); });
+    });
+    document.getElementById("cancelEditTx").addEventListener("click", () => { modal.classList.remove("visible"); modal.innerHTML = ""; });
+    document.getElementById("saveEditTx").addEventListener("click", async () => {
+      const amount = document.getElementById("etAmount").value;
+      if (!amount || !selectedCat) { alert("Completá el monto y la categoría."); return; }
+      const { error } = await supabase.from("transactions").update({
+        amount: -Math.abs(Number(amount)), category_id: selectedCat,
+      }).eq("id", txId);
+      if (error) { alert("No se pudo guardar. Intentá de nuevo."); return; }
+      modal.classList.remove("visible"); modal.innerHTML = "";
+      await loadState(); renderApp();
+      showToast("Gasto actualizado");
+    });
+  }
+  paint();
+}
+
+// ---------------------------------------------------------------
+// MODAL: REGISTRAR PAGO DE DEUDA
+// ---------------------------------------------------------------
+function openPayDebtModal(debtId) {
+  const d = state.debts.find(x => x.id === debtId);
+  const modal = document.getElementById("logModal");
+  modal.classList.add("visible");
+  modal.innerHTML = `
+    <div class="modal-box">
+      <p class="step-label">Registrar pago — ${esc(d.name)}</p>
+      <p style="font-size:12px; color:var(--text-muted); text-align:center; margin:0 0 14px;">Debés ${money(d.current_balance)} ahora mismo.</p>
+      <label>Monto que pagaste</label>
+      <input id="payAmount" type="number" value="${d.minimum_payment ? d.minimum_payment : ""}" style="margin-bottom:16px;" />
+      <div class="error-banner" id="payErr"></div>
+      <div class="btn-row">
+        <button class="btn-secondary" id="cancelPay">Cancelar</button>
+        <button class="btn-primary" id="savePay">Registrar</button>
+      </div>
+    </div>
+  `;
+  document.getElementById("cancelPay").addEventListener("click", () => { modal.classList.remove("visible"); modal.innerHTML = ""; });
+  document.getElementById("savePay").addEventListener("click", async () => {
+    const amount = Number(document.getElementById("payAmount").value);
+    const errEl = document.getElementById("payErr");
+    if (!amount || amount <= 0) {
+      errEl.textContent = "Poné un monto válido.";
+      errEl.classList.add("visible");
+      return;
+    }
+    if (amount > Number(d.current_balance)) {
+      errEl.textContent = `Estás pagando más de lo que debés (${money(d.current_balance)}). Corregí el monto.`;
+      errEl.classList.add("visible");
+      return;
+    }
+    const newBalance = Math.max(0, Number(d.current_balance) - amount);
+
+    // El pago sale de tu bolsillo: se registra como movimiento real
+    // para que el saldo de la cuenta lo refleje (hechos, no intenciones).
+    const { data: txData, error: txError } = await supabase.from("transactions").insert({
+      user_id: user.id, account_id: state.account.id, category_id: null,
+      amount: -Math.abs(amount), note: `Pago: ${d.name}`,
+    }).select().single();
+    if (txError) {
+      errEl.textContent = "No se pudo registrar el pago. Intentá de nuevo.";
+      errEl.classList.add("visible");
+      return;
+    }
+
+    const { error: payError } = await supabase.from("debt_payments").insert({
+      debt_id: d.id, amount, balance_after: newBalance, transaction_id: txData.id,
+    });
+    if (payError) {
+      errEl.textContent = "No se pudo registrar el pago. Intentá de nuevo.";
+      errEl.classList.add("visible");
+      return;
+    }
+    await supabase.from("debts").update({
+      current_balance: newBalance,
+      status: newBalance <= 0 ? "paid_off" : "active",
+    }).eq("id", d.id);
+
+    modal.classList.remove("visible"); modal.innerHTML = "";
+    await loadState(); renderApp();
+    showToast("Pago registrado");
+  });
+}
+
+// ---------------------------------------------------------------
+// MODAL: EDITAR META
+// ---------------------------------------------------------------
+function openEditGoalModal(goalId) {
+  const g = state.goals.find(x => x.id === goalId);
+  const modal = document.getElementById("logModal");
+  modal.classList.add("visible");
+  modal.innerHTML = `
+    <div class="modal-box">
+      <p class="step-label">Editar meta</p>
+      <label>Nombre</label>
+      <input id="egName" value="${esc(g.name)}" style="margin-bottom:10px;" />
+      <label>Monto objetivo</label>
+      <input id="egAmount" type="number" value="${g.target_amount}" style="margin-bottom:10px;" />
+      <label>Plazo (meses)</label>
+      <input id="egMonths" type="number" value="${g.target_months}" style="margin-bottom:10px;" />
+      <label>Prioridad</label>
+      <select id="egPriority" style="margin-bottom:16px;">
+        <option value="critical" ${g.priority === "critical" ? "selected" : ""}>Crítica</option>
+        <option value="important" ${g.priority === "important" ? "selected" : ""}>Importante</option>
+        <option value="optional" ${g.priority === "optional" ? "selected" : ""}>Opcional</option>
+      </select>
+      <div class="btn-row">
+        <button class="btn-secondary" id="cancelEdit">Cancelar</button>
+        <button class="btn-primary" id="saveEdit">Guardar</button>
+      </div>
+    </div>
+  `;
+  document.getElementById("cancelEdit").addEventListener("click", () => { modal.classList.remove("visible"); modal.innerHTML = ""; });
+  document.getElementById("saveEdit").addEventListener("click", async () => {
+    const name = document.getElementById("egName").value.trim();
+    const amount = Number(document.getElementById("egAmount").value);
+    const months = Number(document.getElementById("egMonths").value);
+    const priority = document.getElementById("egPriority").value;
+    if (!name || !amount || !months) { alert("Completá todos los campos."); return; }
+    await supabase.from("goals").update({ name, target_amount: amount, target_months: months, priority }).eq("id", goalId);
+    modal.classList.remove("visible"); modal.innerHTML = "";
+    await loadState(); renderApp();
+    showToast("Meta actualizada");
+  });
+}
+
+// ---------------------------------------------------------------
+// MODAL: REGISTRAR INGRESO
+// ---------------------------------------------------------------
+function openIncomeModal() {
+  const modal = document.getElementById("logModal");
+
+  function paint(saved = false) {
+    modal.classList.add("visible");
+    if (saved) {
+      modal.innerHTML = `
+        <div class="modal-box" style="text-align:center; padding:40px 20px;">
+          <div class="icon-circle" style="background:var(--teal-light); margin:0 auto 10px;">✓</div>
+          <p style="font-size:14px; color:var(--teal); font-weight:500;">Ingreso registrado</p>
+        </div>
+      `;
+      setTimeout(() => { modal.classList.remove("visible"); modal.innerHTML = ""; renderApp(); }, 900);
+      return;
+    }
+    modal.innerHTML = `
+      <div class="modal-box">
+        <p class="step-label">Nuevo ingreso</p>
+        <p style="font-size:12px; color:var(--text-muted); text-align:center; margin:0 0 14px;">Ej. tu sueldo, un pago que te hicieron, una remesa.</p>
+        <input id="incLogAmount" type="number" placeholder="RD$0" style="text-align:center; font-size:24px; margin-bottom:6px;" />
+        <input id="incLogNote" placeholder="Nota (opcional, ej. Sueldo julio)" style="margin-bottom:16px;" />
+        <div class="btn-row">
+          <button class="btn-secondary" id="cancelIncLog">Cancelar</button>
+          <button class="btn-primary" id="saveIncLog">Guardar</button>
+        </div>
+      </div>
+    `;
+    document.getElementById("cancelIncLog").addEventListener("click", () => { modal.classList.remove("visible"); modal.innerHTML = ""; });
+    document.getElementById("saveIncLog").addEventListener("click", async () => {
+      const amount = document.getElementById("incLogAmount").value;
+      const note = document.getElementById("incLogNote").value.trim();
+      if (!amount || Number(amount) <= 0) { alert("Poné un monto válido."); return; }
+      const { error } = await supabase.from("transactions").insert({
+        user_id: user.id, account_id: state.account.id, category_id: null,
+        amount: Math.abs(Number(amount)), note: note || null,
+      });
+      if (error) { alert("No se pudo guardar. Intentá de nuevo."); return; }
+      await loadState();
+      paint(true);
+    });
+  }
+  paint();
+}
+
+// ---------------------------------------------------------------
+// MODAL: REGISTRO RÁPIDO
+// ---------------------------------------------------------------
+function openLogModal() {
+  const modal = document.getElementById("logModal");
+  let selectedCat = null;
+
+  function paint(saved = false) {
+    modal.classList.add("visible");
+    if (saved) {
+      modal.innerHTML = `
+        <div class="modal-box" style="text-align:center; padding:40px 20px;">
+          <div class="icon-circle" style="background:var(--teal-light); margin:0 auto 10px;">✓</div>
+          <p style="font-size:14px; color:var(--teal); font-weight:500;">Gasto registrado</p>
+        </div>
+      `;
+      setTimeout(() => { modal.classList.remove("visible"); modal.innerHTML = ""; renderApp(); }, 900);
+      return;
+    }
+
+    modal.innerHTML = `
+      <div class="modal-box">
+        <p class="step-label">Nuevo gasto</p>
+        <input id="logAmount" type="number" placeholder="RD$0" style="text-align:center; font-size:24px; margin-bottom:14px;" />
+        <label>Categoría</label>
+        <div class="cat-grid">
+          ${categories.map(c => `<div class="cat-option ${selectedCat === c.id ? "selected" : ""}" data-cat="${c.id}">${CATEGORY_ICONS[c.name] || "•"}<br>${c.name}</div>`).join("")}
+        </div>
+        <div class="btn-row">
+          <button class="btn-secondary" id="cancelLog">Cancelar</button>
+          <button class="btn-primary" id="saveLog">Guardar</button>
+        </div>
+      </div>
+    `;
+
+    document.querySelectorAll(".cat-option").forEach(el => {
+      el.addEventListener("click", () => { selectedCat = el.dataset.cat; paint(); });
+    });
+    document.getElementById("cancelLog").addEventListener("click", () => { modal.classList.remove("visible"); modal.innerHTML = ""; });
+    document.getElementById("saveLog").addEventListener("click", async () => {
+      const amount = document.getElementById("logAmount").value;
+      if (!amount || !selectedCat) { alert("Completá el monto y la categoría."); return; }
+      const { error } = await supabase.from("transactions").insert({
+        user_id: user.id, account_id: state.account.id, category_id: selectedCat,
+        amount: -Math.abs(Number(amount)),
+      });
+      if (error) { alert("No se pudo guardar. Intentá de nuevo."); return; }
+      await loadState();
+      paint(true);
+    });
+  }
+  paint();
+}
+
+init();
+</script>
+
+</body>
+</html>

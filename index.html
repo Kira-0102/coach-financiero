@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Coach Financiero</title>
+<link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+
+<div class="screen">
+  <h1 id="formTitle">Iniciá sesión</h1>
+  <p class="subtitle">Tu coach financiero, con tus datos reales.</p>
+
+  <div class="error-banner" id="errorBanner"></div>
+
+  <label for="email">Email</label>
+  <input type="email" id="email" placeholder="tu@email.com" style="margin-bottom:14px;" />
+
+  <label for="password">Contraseña</label>
+  <input type="password" id="password" placeholder="••••••••" style="margin-bottom:20px;" />
+
+  <button class="btn-primary" id="submitBtn" style="width:100%; margin-bottom:14px;">
+    Entrar
+  </button>
+
+  <p style="text-align:center; font-size:13px; color:var(--text-secondary);">
+    <span id="toggleText">¿No tenés cuenta?</span>
+    <button class="link-btn" id="toggleModeBtn">Registrate</button>
+  </p>
+</div>
+
+<script type="module">
+  import { supabase } from "./js/supabaseClient.js";
+
+  let mode = "login"; // login | signup
+
+  const formTitle = document.getElementById("formTitle");
+  const toggleText = document.getElementById("toggleText");
+  const toggleModeBtn = document.getElementById("toggleModeBtn");
+  const submitBtn = document.getElementById("submitBtn");
+  const errorBanner = document.getElementById("errorBanner");
+
+  function showError(msg) {
+    errorBanner.textContent = msg;
+    errorBanner.classList.add("visible");
+  }
+  function clearError() {
+    errorBanner.classList.remove("visible");
+  }
+
+  toggleModeBtn.addEventListener("click", () => {
+    mode = mode === "login" ? "signup" : "login";
+    formTitle.textContent = mode === "login" ? "Iniciá sesión" : "Creá tu cuenta";
+    submitBtn.textContent = mode === "login" ? "Entrar" : "Registrarme";
+    toggleText.textContent = mode === "login" ? "¿No tenés cuenta?" : "¿Ya tenés cuenta?";
+    toggleModeBtn.textContent = mode === "login" ? "Registrate" : "Iniciá sesión";
+    clearError();
+  });
+
+  submitBtn.addEventListener("click", async () => {
+    clearError();
+    const email = document.getElementById("email").value.trim();
+    const password = document.getElementById("password").value;
+
+    if (!email || !password) {
+      showError("Completá email y contraseña.");
+      return;
+    }
+    if (password.length < 6) {
+      showError("La contraseña necesita al menos 6 caracteres.");
+      return;
+    }
+
+    submitBtn.disabled = true;
+    submitBtn.textContent = "Un momento…";
+
+    try {
+      if (mode === "signup") {
+        const { error } = await supabase.auth.signUp({ email, password });
+        if (error) throw error;
+        showError("Cuenta creada. Revisá tu correo si tu proyecto pide confirmación, o entrá directo.");
+      } else {
+        const { error } = await supabase.auth.signInWithPassword({ email, password });
+        if (error) throw error;
+        window.location.href = "app.html";
+        return;
+      }
+    } catch (err) {
+      showError(traducirError(err.message));
+    } finally {
+      submitBtn.disabled = false;
+      submitBtn.textContent = mode === "login" ? "Entrar" : "Registrarme";
+    }
+  });
+
+  function traducirError(msg) {
+    if (msg.includes("Invalid login credentials")) return "Email o contraseña incorrectos.";
+    if (msg.includes("User already registered")) return "Ese email ya tiene una cuenta. Iniciá sesión.";
+    return "No se pudo completar la acción. Intentá de nuevo.";
+  }
+
+  // Si ya hay sesión activa, saltar directo a la app
+  supabase.auth.getSession().then(({ data }) => {
+    if (data.session) window.location.href = "app.html";
+  });
+</script>
+
+</body>
+</html>
