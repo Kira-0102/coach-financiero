@@ -252,7 +252,7 @@ function renderOnboardingAccount() {
       <div class="error-banner" id="err"></div>
 
       <label>Nombre de la cuenta</label>
-      <input id="accName" placeholder="Ej. Banreservas, Efectivo, Ahorros" style="margin-bottom:2px;" />
+      <input id="accName" placeholder="Ej. Banreservas" style="margin-bottom:2px;" />
       <p class="hint">Esto es solo para que la reconozcas vos.</p>
 
       <label>Tipo</label>
@@ -397,7 +397,8 @@ function renderOnboardingFixed() {
 
         <div class="error-banner" id="err"></div>
 
-        <input id="fName" placeholder="Ej. Casa, Gym, Luz" style="margin-bottom:8px;" />
+        <input id="fName" placeholder="Ej. Casa" style="margin-bottom:2px;" />
+        <p class="hint">Uno por vez — escribí el nombre, tocá "+ Agregar", y repetí para el siguiente.</p>
         <label>Categoría</label>
         <select id="fCat" style="margin-bottom:8px;">
           <option value="" selected>Elegí una categoría</option>
@@ -538,7 +539,7 @@ function renderApp() {
         <button class="nav-item ${tab === "inicio" ? "active" : ""}" data-tab="inicio"><span class="icon">🏠</span>Inicio</button>
         <button class="nav-item ${tab === "coach" ? "active" : ""}" data-tab="coach"><span class="icon">💬</span>Coach</button>
         <button class="nav-item ${tab === "simular" ? "active" : ""}" data-tab="simular"><span class="icon">🧮</span>Simular</button>
-        <button class="nav-item ${["mas","gastos","fijos","deudas","presup"].includes(tab) ? "active" : ""}" data-tab="mas"><span class="icon">☰</span>Más</button>
+        <button class="nav-item ${["mas","ingreso","gastos","fijos","deudas","presup"].includes(tab) ? "active" : ""}" data-tab="mas"><span class="icon">☰</span>Más</button>
       </div>
     </div>
     <div class="modal-overlay" id="logModal"></div>
@@ -558,6 +559,7 @@ function renderApp() {
   if (tab === "coach") content.innerHTML = tplCoach();
   if (tab === "simular") content.innerHTML = tplSimular();
   if (tab === "mas") content.innerHTML = tplMas();
+  if (tab === "ingreso") content.innerHTML = backLink() + tplIngreso();
   if (tab === "gastos") content.innerHTML = backLink() + tplGastos();
   if (tab === "metas") content.innerHTML = backLink() + tplMetas();
   if (tab === "fijos") content.innerHTML = backLink() + tplFijos();
@@ -567,14 +569,16 @@ function renderApp() {
   wireTabEvents();
   if (tab === "simular") wireSimulador();
   if (tab === "coach") wireCoach();
+  if (tab === "ingreso") wireIngreso();
 }
 
 function backLink() {
-  return `<button id="backToMas" style="background:none; color:var(--teal); font-size:13px; margin-bottom:14px; padding:0;">‹ Más</button>`;
+  return `<button id="backToMas" style="background:none; color:var(--teal); font-size:13px; margin-bottom:14px; padding:8px 6px; margin-left:-6px;">‹ Más</button>`;
 }
 
 function tplMas() {
   const items = [
+    { tab: "ingreso", icon: "💰", label: "Ingreso", desc: "Cuánto ganás y con qué frecuencia" },
     { tab: "gastos", icon: "🧾", label: "Gastos", desc: "Ver, editar y borrar tus movimientos" },
     { tab: "metas", icon: "🎯", label: "Metas", desc: "Tus objetivos de ahorro" },
     { tab: "fijos", icon: "💳", label: "Gastos fijos", desc: "Lo que se repite cada mes" },
@@ -699,7 +703,7 @@ function tplSimular() {
     <h1 style="text-align:center; margin-bottom:14px;">¿Qué pasa si compro esto?</h1>
     <div class="card" id="simCard">
       <label style="text-align:center; display:block;">¿En qué? <span style="color:var(--text-muted);">(opcional)</span></label>
-      <input type="text" id="simItemName" placeholder="Ej. Tenis, salir a comer, un regalo" style="text-align:center; margin-bottom:14px;" />
+      <input type="text" id="simItemName" placeholder="Ej. Tenis" style="text-align:center; margin-bottom:14px;" />
 
       <div style="display:flex; align-items:center; justify-content:center; gap:6px; margin-bottom:6px;">
         <span style="font-size:28px; font-weight:600; color:var(--teal);">RD$</span>
@@ -868,6 +872,64 @@ function tplInicio() {
     <button class="btn-secondary" id="openIncomeBtn" style="width:100%; margin-top:-8px; margin-bottom:16px;">+ Registrar ingreso</button>
     <p style="text-align:center; margin-top:-8px;"><button class="link-btn" id="logoutBtn" style="font-size:11px;">Cerrar sesión</button></p>
   `;
+}
+
+function tplIngreso() {
+  const freq = state.profile.pay_frequency || "monthly";
+  return `
+    <h1 style="text-align:left; margin-bottom:4px;">Tu ingreso</h1>
+    <p style="font-size:11px; color:var(--text-muted); margin:0 0 16px;">Esto afecta cuánto te dice la app que tenés disponible cada mes.</p>
+
+    <label>¿Con qué frecuencia cobrás?</label>
+    <div class="type-grid" style="grid-template-columns:1fr 1fr; margin-bottom:14px;" id="ingFreqGrid">
+      <div class="type-option ${freq === "monthly" ? "selected" : ""}" data-f="monthly">Fin de mes</div>
+      <div class="type-option ${freq === "biweekly" ? "selected" : ""}" data-f="biweekly">Quincenal</div>
+    </div>
+
+    <label id="ingAmountLabel">${freq === "biweekly" ? "¿Cuánto ganás cada quincena?" : "¿Cuánto ganás al mes?"}</label>
+    <input id="ingAmount" type="number" value="${state.profile.declared_monthly_income ?? ""}" style="margin-bottom:16px;" />
+
+    <div class="error-banner" id="ingErr"></div>
+    <button class="btn-primary" id="saveIngresoBtn" style="width:100%;">Guardar</button>
+  `;
+}
+
+function wireIngreso() {
+  const grid = document.getElementById("ingFreqGrid");
+  if (!grid) return;
+  let selectedFreq = state.profile.pay_frequency || "monthly";
+
+  grid.querySelectorAll(".type-option").forEach(el => {
+    el.addEventListener("click", () => {
+      selectedFreq = el.dataset.f;
+      grid.querySelectorAll(".type-option").forEach(o => o.classList.remove("selected"));
+      el.classList.add("selected");
+      document.getElementById("ingAmountLabel").textContent =
+        selectedFreq === "biweekly" ? "¿Cuánto ganás cada quincena?" : "¿Cuánto ganás al mes?";
+    });
+  });
+
+  document.getElementById("saveIngresoBtn").addEventListener("click", async () => {
+    const amount = document.getElementById("ingAmount").value;
+    const errEl = document.getElementById("ingErr");
+    if (!amount || Number(amount) <= 0) {
+      errEl.textContent = "Poné un monto válido.";
+      errEl.classList.add("visible");
+      return;
+    }
+    const { error } = await supabase.from("profiles").update({
+      declared_monthly_income: Number(amount), pay_frequency: selectedFreq,
+    }).eq("id", user.id);
+    if (error) {
+      errEl.textContent = "No se pudo guardar. Intentá de nuevo.";
+      errEl.classList.add("visible");
+      return;
+    }
+    await loadState();
+    tab = "mas";
+    renderApp();
+    showToast("Ingreso actualizado");
+  });
 }
 
 function tplGastos() {
