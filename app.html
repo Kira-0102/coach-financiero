@@ -40,6 +40,20 @@ let goalMode = "byDeadline"; // solo un modo en Fase 1, pero dejamos la variable
 
 const root = document.getElementById("root");
 
+// P7: quita un ítem del estado local sin recargar TODA la base.
+// Actualización optimista: si el borrado en la base falla, recarga para revertir.
+async function deleteLocal(table, id, stateKey) {
+  const prev = state[stateKey];
+  state[stateKey] = prev.filter(x => x.id !== id);
+  renderApp();
+  const { error } = await supabase.from(table).delete().eq("id", id);
+  if (error) {
+    showToast("No se pudo borrar, reintentando…");
+    await loadState();
+    renderApp();
+  }
+}
+
 function money(n) {
   const num = Number(n) || 0;
   return "RD$" + num.toLocaleString("es-DO", { maximumFractionDigits: 0 });
@@ -174,6 +188,22 @@ function totalGoalMonthlyPace() {
   return state.goals.reduce((sum, g) => sum + goalMonthlyPace(g), 0);
 }
 
+// P6: deriva el estado visible de una meta. 'completed' si ya llegó;
+// 'at_risk' si el ritmo requerido supera holgadamente lo disponible.
+function goalStatus(g) {
+  if (Number(g.current_amount) >= Number(g.target_amount)) return "completed";
+  const pace = goalMonthlyPace(g);
+  const disp = disponible();
+  if (disp > 0 && pace > disp) return "at_risk";
+  return "active";
+}
+
+function goalStatusLabel(status) {
+  return status === "completed" ? { text: "✓ Cumplida", color: "var(--success-text)", bg: "var(--success-bg)" }
+    : status === "at_risk" ? { text: "⚠ En riesgo", color: "var(--warning-text)", bg: "var(--warning-bg)" }
+    : { text: "En curso", color: "var(--teal)", bg: "var(--teal-light)" };
+}
+
 function totalFixed() {
   return state.fixed.reduce((s, f) => s + Number(f.estimated_amount), 0);
 }
@@ -211,14 +241,14 @@ function computeBaselineScore() {
   const income = monthlyIncome();
   if (income <= 0) return null;
 
-  const savingsCapacity = Math.max(0, disponible()) / income; // 0 a 1+
-  const liquidityBuffer = balance() / income; // meses de colchón, aprox
-  const debtRatio = totalDebt() / (income * 3); // 3 meses de ingreso como referencia
+  const savingsCapacity = Math.max(0, Math.min(1, (Math.max(0, disponible()) / income) * 2));
+  const liquidityBuffer = Math.max(0, Math.min(1, balance() / income)); // piso en 0: saldo negativo no arrastra por debajo
+  const debtRatio = Math.max(0, Math.min(1, totalDebt() / (income * 3)));
 
   const score =
-    40 * Math.min(1, savingsCapacity * 2) +
-    30 * Math.min(1, liquidityBuffer) +
-    30 * (1 - Math.min(1, debtRatio));
+    40 * savingsCapacity +
+    30 * liquidityBuffer +
+    30 * (1 - debtRatio);
 
   return Math.round(Math.max(0, Math.min(100, score)));
 }
@@ -264,7 +294,7 @@ function renderOnboardingAccount() {
       </div>
 
       <label>¿Cuánto tenés ahí ahora mismo?</label>
-      <input id="accBalance" type="number" min="0" placeholder="RD$0" style="margin-bottom:20px;" value="${existing ? existing.current_balance : ""}" />
+      <input id="accBalance" type="number" step="1" min="0" placeholder="RD$0" style="margin-bottom:20px;" value="${existing ? existing.current_balance : ""}" />
 
       <button class="btn-primary" id="continueBtn" style="width:100%;">Continuar</button>
     </div>
@@ -323,7 +353,7 @@ function renderOnboardingIncome() {
         </div>
 
         <label style="text-align:center;">${frequency === "biweekly" ? "¿Cuánto ganás cada quincena?" : "¿Cuánto ganás al mes?"}</label>
-        <input id="incAmount" type="number" min="0" placeholder="RD$0" style="text-align:center; font-size:18px; margin-bottom:4px;" value="${state.profile?.declared_monthly_income ?? ""}" />
+        <input id="incAmount" type="number" step="1" min="0" placeholder="RD$0" style="text-align:center; font-size:18px; margin-bottom:4px;" value="${state.profile?.declared_monthly_income ?? ""}" />
         <p class="hint" id="incHint" style="text-align:center;">Antes de descontar tus gastos fijos.</p>
 
         <div class="error-banner" id="err"></div>
@@ -405,7 +435,7 @@ function renderOnboardingFixed() {
           <option value="" selected>Elegí una categoría</option>
           ${categories.map(c => `<option value="${c.id}">${c.name}</option>`).join("")}
         </select>
-        <input id="fAmount" type="number" min="0" placeholder="RD$0" style="margin-bottom:10px;" />
+        <input id="fAmount" type="number" step="1" min="0" placeholder="RD$0" style="margin-bottom:10px;" />
         <button class="btn-secondary" id="addFixedBtn" style="width:100%; margin-bottom:16px;">+ Agregar</button>
 
         <div class="card accent">
@@ -503,10 +533,10 @@ function renderOnboardingGoal() {
         <input id="gName" placeholder="Ej. Fondo de emergencia" style="margin-bottom:12px;" />
 
         <label>Monto objetivo</label>
-        <input id="gAmount" type="number" min="0" placeholder="RD$0" style="margin-bottom:12px;" />
+        <input id="gAmount" type="number" step="1" min="0" placeholder="RD$0" style="margin-bottom:12px;" />
 
         <label>¿En cuántos meses?</label>
-        <input id="gMonths" type="number" min="0" placeholder="Ej. 6" style="margin-bottom:12px;" />
+        <input id="gMonths" type="number" step="1" min="0" placeholder="Ej. 6" style="margin-bottom:12px;" />
 
         <div class="error-banner" id="err"></div>
 
@@ -643,7 +673,7 @@ function tplCoach() {
     </div>
     <div class="error-banner ${coachError ? "visible" : ""}" id="coachErr">${esc(coachError)}</div>
     <div style="display:flex; gap:8px;">
-      <input id="coachInput" placeholder="Preguntale algo a tu coach" style="margin-bottom:0;" ${coachSending ? "disabled" : ""} />
+      <input id="coachInput" placeholder="Preguntale algo a tu coach" maxlength="500" style="margin-bottom:0;" ${coachSending ? "disabled" : ""} />
       <button class="btn-primary" id="coachSendBtn" style="flex:0 0 auto; padding:10px 16px;" ${coachSending ? "disabled" : ""}>${coachSending ? "…" : "Enviar"}</button>
     </div>
   `;
@@ -730,7 +760,7 @@ function tplSimular() {
 
       <div style="display:flex; align-items:center; justify-content:center; gap:6px; margin-bottom:6px;">
         <span style="font-size:28px; font-weight:600; color:var(--teal);">RD$</span>
-        <input type="number" min="0" id="simAmountInput" value="1000" style="font-size:28px; font-weight:600; color:var(--teal); text-align:center; width:140px; border:none; padding:2px; margin-bottom:0;" />
+        <input type="number" step="1" min="0" id="simAmountInput" value="1000" style="font-size:28px; font-weight:600; color:var(--teal); text-align:center; width:140px; border:none; padding:2px; margin-bottom:0;" />
       </div>
       <input type="range" id="simSlider" min="0" max="${Math.max(disponible() * 2, 3000)}" step="50" value="1000" style="width:100%; margin-bottom:16px;" />
       <div class="row-between" style="background:white; border-radius:10px; padding:10px 12px; margin-bottom:8px;">
@@ -854,7 +884,7 @@ function tplInicio() {
       <div class="score-box">
         <p class="label">Situación</p>
         <p class="value" style="color:var(--teal);">${baseline !== null ? baseline : "—"}</p>
-        <p style="font-size:10px; color:var(--text-muted); margin:4px 0 0;">Según tu ingreso, deuda y ahorro</p>
+        <p style="font-size:10px; color:var(--text-muted); margin:4px 0 0;">${balance() <= 0 ? "Estimado — cargá tu saldo para afinarlo" : "Según tu ingreso, deuda y ahorro"}</p>
       </div>
       <div class="score-box">
         <p class="label">Hábitos</p>
@@ -863,23 +893,26 @@ function tplInicio() {
       </div>
     </div>
 
-    <div class="card row-between" style="margin-bottom:10px; ${balance() < 0 ? 'background:var(--danger-bg);' : ''}">
+    <div class="card row-between" id="cardSaldo" style="margin-bottom:10px; cursor:pointer; ${balance() < 0 ? 'background:var(--danger-bg);' : ''}">
       <span style="font-size:12px; color:${balance() < 0 ? 'var(--danger-text)' : 'var(--text-secondary)'};">
         ${balance() < 0 ? '⚠ Saldo en negativo' : 'Saldo en cuenta'}
       </span>
-      <span style="font-weight:600; color:${balance() < 0 ? 'var(--danger-text)' : 'var(--teal)'};">${money(balance())}</span>
+      <span style="font-weight:600; color:${balance() < 0 ? 'var(--danger-text)' : 'var(--teal)'};">${money(balance())} ›</span>
     </div>
 
     ${g ? `
-      <div class="card">
+      <div class="card" id="cardMeta" style="cursor:pointer;">
         <div class="row-between" style="margin-bottom:6px;">
           <span style="font-weight:500;">${esc(g.name)}</span>
-          <span class="badge ${g.priority}">${g.priority === "critical" ? "Crítica" : g.priority === "important" ? "Importante" : "Opcional"}</span>
+          <span style="display:flex; align-items:center; gap:6px;">
+            <span class="badge ${g.priority}">${g.priority === "critical" ? "Crítica" : g.priority === "important" ? "Importante" : "Opcional"}</span>
+            <span style="color:var(--text-muted);">›</span>
+          </span>
         </div>
         <p style="font-size:11px; color:var(--text-muted); margin:0 0 6px;">${money(g.current_amount)} de ${money(g.target_amount)} · ${g.target_months} meses</p>
         <div class="progress-bar"><div class="progress-fill" style="width:${progressPct}%;"></div></div>
       </div>
-      ${state.goals.length > 1 ? `<p style="font-size:11px; color:var(--text-muted); margin:-4px 0 10px; text-align:center;">+${state.goals.length - 1} meta${state.goals.length > 2 ? "s" : ""} más en "Más → Metas"</p>` : ""}
+      ${state.goals.length > 1 ? `<p style="font-size:11px; color:var(--text-muted); margin:-4px 0 10px; text-align:center;">+${state.goals.length - 1} meta${state.goals.length > 2 ? "s" : ""} más</p>` : ""}
     ` : ""}
 
     <div class="card accent" style="display:flex; gap:8px;">
@@ -891,8 +924,10 @@ function tplInicio() {
       </p>
     </div>
 
-    <button class="fab" id="openLogBtn">+ Registrar gasto</button>
-    <button class="btn-secondary" id="openIncomeBtn" style="width:100%; margin-top:-8px; margin-bottom:16px;">+ Registrar ingreso</button>
+    <div class="btn-row" style="margin:16px 0 8px;">
+      <button class="fab" id="openLogBtn" style="margin:0;">+ Gasto</button>
+      <button class="btn-secondary" id="openIncomeBtn" style="flex:1; padding:13px;">+ Ingreso</button>
+    </div>
     <p style="text-align:center; margin-top:-8px;"><button class="link-btn" id="logoutBtn" style="font-size:11px;">Cerrar sesión</button></p>
   `;
 }
@@ -910,7 +945,7 @@ function tplIngreso() {
     </div>
 
     <label id="ingAmountLabel">${freq === "biweekly" ? "¿Cuánto ganás cada quincena?" : "¿Cuánto ganás al mes?"}</label>
-    <input id="ingAmount" type="number" min="0" value="${state.profile.declared_monthly_income ?? ""}" style="margin-bottom:16px;" />
+    <input id="ingAmount" type="number" step="1" min="0" value="${state.profile.declared_monthly_income ?? ""}" style="margin-bottom:16px;" />
 
     <div class="error-banner" id="ingErr"></div>
     <button class="btn-primary" id="saveIngresoBtn" style="width:100%;">Guardar</button>
@@ -1000,6 +1035,9 @@ function tplMetas() {
     const progressPct = Math.min(100, Math.round((Number(g.current_amount) / Number(g.target_amount)) * 100));
     const monthly = goalMonthlyPace(g);
     const priorityLabel = g.priority === "critical" ? "Crítica" : g.priority === "important" ? "Importante" : "Opcional";
+    const st = goalStatus(g);
+    const stLabel = goalStatusLabel(st);
+    const done = st === "completed";
     return `
       <div class="card">
         <div class="row-between" style="margin-bottom:6px;">
@@ -1010,9 +1048,16 @@ function tplMetas() {
             <button data-del-goal="${g.id}" style="background:none; color:var(--text-muted); font-size:12px;">✕</button>
           </div>
         </div>
+        <div style="display:inline-block; font-size:10px; border-radius:10px; padding:2px 8px; margin-bottom:8px; background:${stLabel.bg}; color:${stLabel.color};">${stLabel.text}</div>
         <p style="font-size:11px; color:var(--text-muted); margin:0 0 6px;">${money(g.current_amount)} de ${money(g.target_amount)} · ${g.target_months} meses</p>
-        <div class="progress-bar"><div class="progress-fill" style="width:${progressPct}%;"></div></div>
-        <p style="font-size:11px; color:var(--text-muted); margin:8px 0 0;">Aporte mensual necesario: ${money(monthly)}</p>
+        <div class="progress-bar"><div class="progress-fill" style="width:${progressPct}%; background:${done ? 'var(--success-text)' : 'var(--gold)'};"></div></div>
+        ${done
+          ? `<p style="font-size:11px; color:var(--success-text); margin:8px 0 0;">Llegaste a tu objetivo 🎉</p>`
+          : `<div class="row-between" style="margin-top:10px;">
+               <span style="font-size:11px; color:var(--text-muted);">Aporte mensual: ${money(monthly)}</span>
+               <button data-contribute="${g.id}" class="btn-secondary" style="padding:6px 12px; font-size:12px;">+ Aportar</button>
+             </div>`
+        }
       </div>
     `;
   }).join("");
@@ -1025,8 +1070,8 @@ function tplMetas() {
     }
     <div style="margin-top:14px;">
       <input id="newGName" placeholder="Ej. Laptop nueva" style="margin-bottom:8px;" />
-      <input id="newGAmount" type="number" min="0" placeholder="Monto objetivo" style="margin-bottom:8px;" />
-      <input id="newGMonths" type="number" min="0" placeholder="¿En cuántos meses?" style="margin-bottom:8px;" />
+      <input id="newGAmount" type="number" step="1" min="0" placeholder="Monto objetivo" style="margin-bottom:8px;" />
+      <input id="newGMonths" type="number" step="1" min="0" placeholder="¿En cuántos meses?" style="margin-bottom:8px;" />
       <button class="btn-secondary" id="addGoalBtn" style="width:100%;">+ Agregar meta</button>
     </div>
   `;
@@ -1068,7 +1113,7 @@ function fixedAddForm() {
         <option value="" selected>Elegí una categoría</option>
         ${categories.map(c => `<option value="${c.id}">${c.name}</option>`).join("")}
       </select>
-      <input id="newFAmount" type="number" min="0" placeholder="RD$0" style="margin-bottom:8px;" />
+      <input id="newFAmount" type="number" step="1" min="0" placeholder="RD$0" style="margin-bottom:8px;" />
       <button class="btn-secondary" id="addFixedTabBtn" style="width:100%;">+ Agregar gasto fijo</button>
     </div>
   `;
@@ -1126,11 +1171,11 @@ function debtAddForm() {
         <option value="" selected>Elegí un tipo</option>
         ${DEBT_TYPES.map(t => `<option value="${t.value}">${t.icon} ${t.label}</option>`).join("")}
       </select>
-      <input id="newDAmount" type="number" min="0" placeholder="Monto total de la deuda" style="margin-bottom:8px;" />
+      <input id="newDAmount" type="number" step="1" min="0" placeholder="Monto total de la deuda" style="margin-bottom:8px;" />
       <label>Tasa de interés anual <span style="color:var(--text-muted);">(opcional, en %)</span></label>
-      <input id="newDInterest" type="number" min="0" placeholder="Ej. 45" style="margin-bottom:8px;" />
+      <input id="newDInterest" type="number" step="1" min="0" placeholder="Ej. 45" style="margin-bottom:8px;" />
       <label>¿En cuántas cuotas planeás pagarla? <span style="color:var(--text-muted);">(opcional)</span></label>
-      <input id="newDInstallments" type="number" min="0" placeholder="Ej. 10" style="margin-bottom:8px;" />
+      <input id="newDInstallments" type="number" step="1" min="0" placeholder="Ej. 10" style="margin-bottom:8px;" />
       <button class="btn-secondary" id="addDebtBtn" style="width:100%;">+ Agregar deuda</button>
     </div>
   `;
@@ -1156,12 +1201,12 @@ function tplPresupuestos() {
             <p style="font-size:11px; color:var(--text-muted); margin:0 0 6px;">${money(spent)} de ${money(budget.amount)} este mes</p>
             <div class="progress-bar"><div class="progress-fill" style="width:${pct}%; background:${pct >= 100 ? 'var(--danger-text)' : 'var(--gold)'};"></div></div>
             <div style="display:flex; gap:6px; margin-top:8px;">
-              <input type="number" min="0" placeholder="Nuevo monto" id="budgetEditInput-${c.id}" style="margin-bottom:0;" />
+              <input type="number" step="1" min="0" placeholder="Nuevo monto" id="budgetEditInput-${c.id}" style="margin-bottom:0;" />
               <button data-update-budget="${budget.id}" data-update-cat="${c.id}" class="btn-secondary" style="white-space:nowrap;">Actualizar</button>
             </div>
           ` : `
             <div style="display:flex; gap:6px;">
-              <input type="number" min="0" placeholder="RD$0" id="budgetInput-${c.id}" style="margin-bottom:0;" />
+              <input type="number" step="1" min="0" placeholder="RD$0" id="budgetInput-${c.id}" style="margin-bottom:0;" />
               <button data-set-budget="${c.id}" class="btn-secondary" style="white-space:nowrap;">Fijar</button>
             </div>
           `}
@@ -1180,6 +1225,12 @@ function wireTabEvents() {
 
   const openIncomeBtn = document.getElementById("openIncomeBtn");
   if (openIncomeBtn) openIncomeBtn.addEventListener("click", openIncomeModal);
+
+  const cardSaldo = document.getElementById("cardSaldo");
+  if (cardSaldo) cardSaldo.addEventListener("click", () => { tab = "gastos"; renderApp(); });
+
+  const cardMeta = document.getElementById("cardMeta");
+  if (cardMeta) cardMeta.addEventListener("click", () => { tab = "metas"; renderApp(); });
 
   const gastosAddExpenseBtn = document.getElementById("gastosAddExpenseBtn");
   if (gastosAddExpenseBtn) gastosAddExpenseBtn.addEventListener("click", openLogModal);
@@ -1212,19 +1263,22 @@ function wireTabEvents() {
     const amount = document.getElementById("newGAmount").value;
     const months = document.getElementById("newGMonths").value;
     if (!name || Number(amount) <= 0 || Number(months) <= 0) { alert("Completá el nombre, el monto y el plazo (mayores a cero)."); return; }
+    const yaExiste = state.goals.some(g => g.name.trim().toLowerCase() === name.toLowerCase());
+    if (yaExiste && !confirm(`Ya tenés una meta llamada "${name}". ¿Querés crear otra igual de todos modos?`)) return;
+    addGoalBtn.disabled = true;
+    addGoalBtn.textContent = "Guardando…";
     const { error } = await supabase.from("goals").insert({
       user_id: user.id, name, target_amount: Number(amount), target_months: Number(months),
       linked_account_id: state.account.id, priority: "important",
     });
-    if (error) { alert("No se pudo guardar. Intentá de nuevo."); return; }
+    if (error) { alert("No se pudo guardar. Intentá de nuevo."); addGoalBtn.disabled = false; addGoalBtn.textContent = "+ Agregar meta"; return; }
     await loadState(); renderApp();
   });
 
   document.querySelectorAll("[data-del-goal]").forEach(btn => {
     btn.addEventListener("click", async () => {
       if (!(await confirmAction("¿Borrar esta meta?"))) return;
-      await supabase.from("goals").delete().eq("id", btn.dataset.delGoal);
-      await loadState(); renderApp();
+      await deleteLocal("goals", btn.dataset.delGoal, "goals");
     });
   });
 
@@ -1232,11 +1286,14 @@ function wireTabEvents() {
     btn.addEventListener("click", () => openEditGoalModal(btn.dataset.editGoal));
   });
 
+  document.querySelectorAll("[data-contribute]").forEach(btn => {
+    btn.addEventListener("click", () => openContributeModal(btn.dataset.contribute));
+  });
+
   document.querySelectorAll("[data-del-fixed]").forEach(btn => {
     btn.addEventListener("click", async () => {
       if (!(await confirmAction("¿Borrar este gasto fijo?"))) return;
-      await supabase.from("recurring_expense_templates").delete().eq("id", btn.dataset.delFixed);
-      await loadState(); renderApp();
+      await deleteLocal("recurring_expense_templates", btn.dataset.delFixed, "fixed");
     });
   });
 
@@ -1256,8 +1313,7 @@ function wireTabEvents() {
   document.querySelectorAll("[data-del-debt]").forEach(btn => {
     btn.addEventListener("click", async () => {
       if (!(await confirmAction("¿Borrar esta deuda?"))) return;
-      await supabase.from("debts").delete().eq("id", btn.dataset.delDebt);
-      await loadState(); renderApp();
+      await deleteLocal("debts", btn.dataset.delDebt, "debts");
     });
   });
 
@@ -1272,8 +1328,7 @@ function wireTabEvents() {
   document.querySelectorAll("[data-del-tx]").forEach(btn => {
     btn.addEventListener("click", async () => {
       if (!(await confirmAction("¿Borrar este gasto?"))) return;
-      await supabase.from("transactions").delete().eq("id", btn.dataset.delTx);
-      await loadState(); renderApp();
+      await deleteLocal("transactions", btn.dataset.delTx, "transactions");
     });
   });
 
@@ -1366,7 +1421,7 @@ function openEditDebtModal(debtId) {
         ${DEBT_TYPES.map(t => `<option value="${t.value}" ${d.debt_type === t.value ? "selected" : ""}>${t.icon} ${t.label}</option>`).join("")}
       </select>
       <label>Tasa de interés anual (%)</label>
-      <input id="edInterest" type="number" min="0" value="${d.interest_rate ?? ""}" style="margin-bottom:16px;" />
+      <input id="edInterest" type="number" step="1" min="0" value="${d.interest_rate ?? ""}" style="margin-bottom:16px;" />
       <div class="btn-row">
         <button class="btn-secondary" id="cancelEditDebt">Cancelar</button>
         <button class="btn-primary" id="saveEditDebt">Guardar</button>
@@ -1406,7 +1461,7 @@ function openEditFixedModal(fixedId) {
         ${categories.map(c => `<option value="${c.id}" ${f.category_id === c.id ? "selected" : ""}>${c.name}</option>`).join("")}
       </select>
       <label>Monto mensual</label>
-      <input id="efAmount" type="number" min="0" value="${f.estimated_amount}" style="margin-bottom:16px;" />
+      <input id="efAmount" type="number" step="1" min="0" value="${f.estimated_amount}" style="margin-bottom:16px;" />
       <div class="btn-row">
         <button class="btn-secondary" id="cancelEditFixed">Cancelar</button>
         <button class="btn-primary" id="saveEditFixed">Guardar</button>
@@ -1441,7 +1496,7 @@ function openEditTxModal(txId) {
     modal.innerHTML = `
       <div class="modal-box">
         <p class="step-label">Editar gasto</p>
-        <input id="etAmount" type="number" min="0" value="${Math.abs(t.amount)}" style="text-align:center; font-size:24px; margin-bottom:14px;" />
+        <input id="etAmount" type="number" step="1" min="0" value="${Math.abs(t.amount)}" style="text-align:center; font-size:24px; margin-bottom:14px;" />
         <label>Categoría</label>
         <div class="cat-grid">
           ${categories.map(c => `<div class="cat-option ${selectedCat === c.id ? "selected" : ""}" data-cat="${c.id}">${CATEGORY_ICONS[c.name] || "•"}<br>${c.name}</div>`).join("")}
@@ -1483,7 +1538,7 @@ function openPayDebtModal(debtId) {
       <p class="step-label">Registrar pago — ${esc(d.name)}</p>
       <p style="font-size:12px; color:var(--text-muted); text-align:center; margin:0 0 14px;">Debés ${money(d.current_balance)} ahora mismo.</p>
       <label>Monto que pagaste</label>
-      <input id="payAmount" type="number" min="0" value="${d.minimum_payment ? d.minimum_payment : ""}" style="margin-bottom:16px;" />
+      <input id="payAmount" type="number" step="1" min="0" value="${d.minimum_payment ? d.minimum_payment : ""}" style="margin-bottom:16px;" />
       <div class="error-banner" id="payErr"></div>
       <div class="btn-row">
         <button class="btn-secondary" id="cancelPay">Cancelar</button>
@@ -1539,6 +1594,79 @@ function openPayDebtModal(debtId) {
 }
 
 // ---------------------------------------------------------------
+// MODAL: APORTAR A UNA META (P1)
+// El aporte sale del bolsillo → se registra como transacción real
+// (hechos, no intenciones), sube el progreso, y queda auditable.
+// ---------------------------------------------------------------
+function openContributeModal(goalId) {
+  const g = state.goals.find(x => x.id === goalId);
+  const modal = document.getElementById("logModal");
+  const restante = Math.max(0, Number(g.target_amount) - Number(g.current_amount));
+  const sugerido = Math.min(Math.round(goalMonthlyPace(g)), restante);
+  modal.classList.add("visible");
+  modal.innerHTML = `
+    <div class="modal-box">
+      <p class="step-label">Aportar a "${esc(g.name)}"</p>
+      <p style="font-size:12px; color:var(--text-muted); text-align:center; margin:0 0 4px;">Te falta ${money(restante)} para tu objetivo.</p>
+      <p style="font-size:11px; color:var(--text-muted); text-align:center; margin:0 0 14px;">Saldo disponible ahora: ${money(balance())}</p>
+      <label>¿Cuánto querés apartar?</label>
+      <input id="contribAmount" type="number" min="0" step="1" value="${sugerido > 0 ? sugerido : ""}" style="margin-bottom:16px;" />
+      <div class="error-banner" id="contribErr"></div>
+      <div class="btn-row">
+        <button class="btn-secondary" id="cancelContrib">Cancelar</button>
+        <button class="btn-primary" id="saveContrib">Aportar</button>
+      </div>
+    </div>
+  `;
+  document.getElementById("cancelContrib").addEventListener("click", () => { modal.classList.remove("visible"); modal.innerHTML = ""; });
+  document.getElementById("saveContrib").addEventListener("click", async () => {
+    const amount = Number(document.getElementById("contribAmount").value);
+    const errEl = document.getElementById("contribErr");
+    if (!amount || amount <= 0) {
+      errEl.textContent = "Poné un monto válido.";
+      errEl.classList.add("visible");
+      return;
+    }
+    if (amount > restante) {
+      errEl.textContent = `Con ${money(amount)} pasarías tu objetivo. Te falta solo ${money(restante)}.`;
+      errEl.classList.add("visible");
+      return;
+    }
+    const saveBtn = document.getElementById("saveContrib");
+    saveBtn.disabled = true;
+    saveBtn.textContent = "Aportando…";
+
+    const newAmount = Number(g.current_amount) + amount;
+    const completed = newAmount >= Number(g.target_amount);
+
+    // 1. Registrar el movimiento real (sale del saldo)
+    const { data: txData, error: txError } = await supabase.from("transactions").insert({
+      user_id: user.id, account_id: state.account.id, category_id: null,
+      amount: -Math.abs(amount), note: `Aporte: ${g.name}`,
+    }).select().single();
+    if (txError) {
+      errEl.textContent = "No se pudo registrar. Intentá de nuevo.";
+      errEl.classList.add("visible");
+      saveBtn.disabled = false; saveBtn.textContent = "Aportar";
+      return;
+    }
+    // 2. Historial de aporte
+    await supabase.from("goal_contributions").insert({
+      goal_id: g.id, transaction_id: txData.id, amount, amount_after: newAmount,
+    });
+    // 3. Subir el progreso y marcar completada si llegó
+    await supabase.from("goals").update({
+      current_amount: newAmount,
+      status: completed ? "completed" : "active",
+    }).eq("id", g.id);
+
+    modal.classList.remove("visible"); modal.innerHTML = "";
+    await loadState(); renderApp();
+    showToast(completed ? "¡Meta cumplida! 🎉" : "Aporte registrado");
+  });
+}
+
+// ---------------------------------------------------------------
 // MODAL: EDITAR META
 // ---------------------------------------------------------------
 function openEditGoalModal(goalId) {
@@ -1551,9 +1679,9 @@ function openEditGoalModal(goalId) {
       <label>Nombre</label>
       <input id="egName" value="${esc(g.name)}" style="margin-bottom:10px;" />
       <label>Monto objetivo</label>
-      <input id="egAmount" type="number" min="0" value="${g.target_amount}" style="margin-bottom:10px;" />
+      <input id="egAmount" type="number" step="1" min="0" value="${g.target_amount}" style="margin-bottom:10px;" />
       <label>Plazo (meses)</label>
-      <input id="egMonths" type="number" min="0" value="${g.target_months}" style="margin-bottom:10px;" />
+      <input id="egMonths" type="number" step="1" min="0" value="${g.target_months}" style="margin-bottom:10px;" />
       <label>Prioridad</label>
       <select id="egPriority" style="margin-bottom:16px;">
         <option value="critical" ${g.priority === "critical" ? "selected" : ""}>Crítica</option>
@@ -1602,7 +1730,7 @@ function openIncomeModal() {
       <div class="modal-box">
         <p class="step-label">Nuevo ingreso</p>
         <p style="font-size:12px; color:var(--text-muted); text-align:center; margin:0 0 14px;">Ej. tu sueldo, un pago que te hicieron, una remesa.</p>
-        <input id="incLogAmount" type="number" min="0" placeholder="RD$0" style="text-align:center; font-size:24px; margin-bottom:6px;" />
+        <input id="incLogAmount" type="number" step="1" min="0" placeholder="RD$0" style="text-align:center; font-size:24px; margin-bottom:6px;" />
         <input id="incLogNote" placeholder="Nota (opcional, ej. Sueldo julio)" style="margin-bottom:16px;" />
         <div class="btn-row">
           <button class="btn-secondary" id="cancelIncLog">Cancelar</button>
@@ -1615,11 +1743,19 @@ function openIncomeModal() {
       const amount = document.getElementById("incLogAmount").value;
       const note = document.getElementById("incLogNote").value.trim();
       if (!amount || Number(amount) <= 0) { alert("Poné un monto válido."); return; }
+      const saveBtn = document.getElementById("saveIncLog");
+      saveBtn.disabled = true;
+      saveBtn.textContent = "Guardando…";
       const { error } = await supabase.from("transactions").insert({
         user_id: user.id, account_id: state.account.id, category_id: null,
         amount: Math.abs(Number(amount)), note: note || null,
       });
-      if (error) { alert("No se pudo guardar. Intentá de nuevo."); return; }
+      if (error) {
+        alert("No se pudo guardar. Intentá de nuevo.");
+        saveBtn.disabled = false;
+        saveBtn.textContent = "Guardar";
+        return;
+      }
       await loadState();
       paint(true);
     });
@@ -1650,7 +1786,7 @@ function openLogModal() {
     modal.innerHTML = `
       <div class="modal-box">
         <p class="step-label">Nuevo gasto</p>
-        <input id="logAmount" type="number" min="0" placeholder="RD$0" style="text-align:center; font-size:24px; margin-bottom:14px;" />
+        <input id="logAmount" type="number" step="1" min="0" placeholder="RD$0" style="text-align:center; font-size:24px; margin-bottom:14px;" />
         <label>Categoría</label>
         <div class="cat-grid">
           ${categories.map(c => `<div class="cat-option ${selectedCat === c.id ? "selected" : ""}" data-cat="${c.id}">${CATEGORY_ICONS[c.name] || "•"}<br>${c.name}</div>`).join("")}
@@ -1668,12 +1804,20 @@ function openLogModal() {
     document.getElementById("cancelLog").addEventListener("click", () => { modal.classList.remove("visible"); modal.innerHTML = ""; });
     document.getElementById("saveLog").addEventListener("click", async () => {
       const amount = document.getElementById("logAmount").value;
-      if (!amount || !selectedCat) { alert("Completá el monto y la categoría."); return; }
+      if (!amount || Number(amount) <= 0 || !selectedCat) { alert("Completá el monto y la categoría."); return; }
+      const saveBtn = document.getElementById("saveLog");
+      saveBtn.disabled = true;
+      saveBtn.textContent = "Guardando…";
       const { error } = await supabase.from("transactions").insert({
         user_id: user.id, account_id: state.account.id, category_id: selectedCat,
         amount: -Math.abs(Number(amount)),
       });
-      if (error) { alert("No se pudo guardar. Intentá de nuevo."); return; }
+      if (error) {
+        alert("No se pudo guardar. Intentá de nuevo.");
+        saveBtn.disabled = false;
+        saveBtn.textContent = "Guardar";
+        return;
+      }
       await loadState();
       paint(true);
     });
