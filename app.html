@@ -456,39 +456,58 @@ function renderOnboardingFixed() {
 // ONBOARDING — PASO 4: META
 // ---------------------------------------------------------------
 function renderOnboardingGoal() {
-  function paint() {
+  function renderCard() {
     const amountVal = document.getElementById("gAmount")?.value || "";
     const monthsVal = document.getElementById("gMonths")?.value || "";
     const target = Number(amountVal) || 0;
     const months = Number(monthsVal) || 0;
     const monthly = months > 0 ? target / months : 0;
     const pct = disponible() > 0 && monthly > 0 ? Math.round((monthly / disponible()) * 100) : 0;
+    const sospechosamenteBajo = target > 0 && totalFixed() > 0 && target < totalFixed();
 
+    const cardEl = document.getElementById("goalViabilityCard");
+    if (!cardEl) return;
+
+    if (!target || !months) {
+      cardEl.innerHTML = `<div class="card" style="text-align:center;"><p style="font-size:12px; color:var(--text-muted); margin:0;">Completá los campos para ver si es alcanzable</p></div>`;
+      return;
+    }
+
+    cardEl.innerHTML = `
+      <div class="card ${pct <= 40 ? "success" : "warning"}">
+        <p style="font-size:12px; margin:0; color:${pct <= 40 ? "var(--success-text)" : "var(--warning-text)"};">
+          ${pct <= 40 ? "✓ Esta meta parece alcanzable." : "⚠ Puede ser difícil de sostener."}
+          ${money(monthly)}/mes — un ${pct}% de tu disponible.
+        </p>
+      </div>
+      ${sospechosamenteBajo ? `
+        <div class="card warning" style="margin-top:8px;">
+          <p style="font-size:12px; margin:0; color:var(--warning-text);">
+            ⚠ ${money(target)} es menos que un mes de tus gastos fijos (${money(totalFixed())}). Si es tu fondo de emergencia, revisá que no te haya faltado un cero.
+          </p>
+        </div>
+      ` : ""}
+    `;
+  }
+
+  function paint() {
     root.innerHTML = `
       <div class="screen">
         <p class="step-label">Paso 4 de 4</p>
         <h1>Creá tu primera meta</h1>
 
         <label>¿Cómo la llamamos?</label>
-        <input id="gName" placeholder="Ej. Fondo de emergencia" style="margin-bottom:12px;" value="${document.getElementById("gName")?.value || ""}" />
+        <input id="gName" placeholder="Ej. Fondo de emergencia" style="margin-bottom:12px;" />
 
         <label>Monto objetivo</label>
-        <input id="gAmount" type="number" placeholder="RD$0" style="margin-bottom:12px;" value="${amountVal}" />
+        <input id="gAmount" type="number" placeholder="RD$0" style="margin-bottom:12px;" />
 
         <label>¿En cuántos meses?</label>
-        <input id="gMonths" type="number" placeholder="Ej. 6" style="margin-bottom:12px;" value="${monthsVal}" />
+        <input id="gMonths" type="number" placeholder="Ej. 6" style="margin-bottom:12px;" />
 
         <div class="error-banner" id="err"></div>
 
-        ${target && months
-          ? `<div class="card ${pct <= 40 ? "success" : "warning"}">
-               <p style="font-size:12px; margin:0; color:${pct <= 40 ? "var(--success-text)" : "var(--warning-text)"};">
-                 ${pct <= 40 ? "✓ Esta meta parece alcanzable." : "⚠ Puede ser difícil de sostener."}
-                 ${money(monthly)}/mes — un ${pct}% de tu disponible.
-               </p>
-             </div>`
-          : `<div class="card" style="text-align:center;"><p style="font-size:12px; color:var(--text-muted); margin:0;">Completá los campos para ver si es alcanzable</p></div>`
-        }
+        <div id="goalViabilityCard"></div>
 
         <div class="btn-row" style="margin-top:16px;">
           <button class="btn-back" id="backBtn">‹</button>
@@ -497,15 +516,16 @@ function renderOnboardingGoal() {
       </div>
     `;
 
-    ["gAmount", "gMonths"].forEach(id => {
-      document.getElementById(id).addEventListener("input", paint);
-    });
-    document.getElementById("gName").addEventListener("input", () => {}); // no repintar para no perder foco
+    renderCard();
+    document.getElementById("gAmount").addEventListener("input", renderCard);
+    document.getElementById("gMonths").addEventListener("input", renderCard);
 
     document.getElementById("backBtn").addEventListener("click", () => renderOnboardingFixed());
 
     document.getElementById("finishBtn").addEventListener("click", async () => {
       const name = document.getElementById("gName").value.trim();
+      const target = Number(document.getElementById("gAmount").value) || 0;
+      const months = Number(document.getElementById("gMonths").value) || 0;
       const errEl = document.getElementById("err");
       if (!name || !target || !months) {
         errEl.textContent = "Completá todos los campos.";
