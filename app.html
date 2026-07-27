@@ -264,7 +264,7 @@ function renderOnboardingAccount() {
       </div>
 
       <label>¿Cuánto tenés ahí ahora mismo?</label>
-      <input id="accBalance" type="number" placeholder="RD$0" style="margin-bottom:20px;" value="${existing ? existing.current_balance : ""}" />
+      <input id="accBalance" type="number" min="0" placeholder="RD$0" style="margin-bottom:20px;" value="${existing ? existing.current_balance : ""}" />
 
       <button class="btn-primary" id="continueBtn" style="width:100%;">Continuar</button>
     </div>
@@ -323,7 +323,7 @@ function renderOnboardingIncome() {
         </div>
 
         <label style="text-align:center;">${frequency === "biweekly" ? "¿Cuánto ganás cada quincena?" : "¿Cuánto ganás al mes?"}</label>
-        <input id="incAmount" type="number" placeholder="RD$0" style="text-align:center; font-size:18px; margin-bottom:4px;" value="${state.profile?.declared_monthly_income ?? ""}" />
+        <input id="incAmount" type="number" min="0" placeholder="RD$0" style="text-align:center; font-size:18px; margin-bottom:4px;" value="${state.profile?.declared_monthly_income ?? ""}" />
         <p class="hint" id="incHint" style="text-align:center;">Antes de descontar tus gastos fijos.</p>
 
         <div class="error-banner" id="err"></div>
@@ -405,7 +405,7 @@ function renderOnboardingFixed() {
           <option value="" selected>Elegí una categoría</option>
           ${categories.map(c => `<option value="${c.id}">${c.name}</option>`).join("")}
         </select>
-        <input id="fAmount" type="number" placeholder="RD$0" style="margin-bottom:10px;" />
+        <input id="fAmount" type="number" min="0" placeholder="RD$0" style="margin-bottom:10px;" />
         <button class="btn-secondary" id="addFixedBtn" style="width:100%; margin-bottom:16px;">+ Agregar</button>
 
         <div class="card accent">
@@ -471,7 +471,7 @@ function renderOnboardingGoal() {
     const cardEl = document.getElementById("goalViabilityCard");
     if (!cardEl) return;
 
-    if (!target || !months) {
+    if (target <= 0 || months <= 0) {
       cardEl.innerHTML = `<div class="card" style="text-align:center;"><p style="font-size:12px; color:var(--text-muted); margin:0;">Completá los campos para ver si es alcanzable</p></div>`;
       return;
     }
@@ -503,10 +503,10 @@ function renderOnboardingGoal() {
         <input id="gName" placeholder="Ej. Fondo de emergencia" style="margin-bottom:12px;" />
 
         <label>Monto objetivo</label>
-        <input id="gAmount" type="number" placeholder="RD$0" style="margin-bottom:12px;" />
+        <input id="gAmount" type="number" min="0" placeholder="RD$0" style="margin-bottom:12px;" />
 
         <label>¿En cuántos meses?</label>
-        <input id="gMonths" type="number" placeholder="Ej. 6" style="margin-bottom:12px;" />
+        <input id="gMonths" type="number" min="0" placeholder="Ej. 6" style="margin-bottom:12px;" />
 
         <div class="error-banner" id="err"></div>
 
@@ -530,7 +530,7 @@ function renderOnboardingGoal() {
       const target = Number(document.getElementById("gAmount").value) || 0;
       const months = Number(document.getElementById("gMonths").value) || 0;
       const errEl = document.getElementById("err");
-      if (!name || !target || !months) {
+      if (!name || target <= 0 || months <= 0) {
         errEl.textContent = "Completá todos los campos.";
         errEl.classList.add("visible");
         return;
@@ -730,7 +730,7 @@ function tplSimular() {
 
       <div style="display:flex; align-items:center; justify-content:center; gap:6px; margin-bottom:6px;">
         <span style="font-size:28px; font-weight:600; color:var(--teal);">RD$</span>
-        <input type="number" id="simAmountInput" value="1000" style="font-size:28px; font-weight:600; color:var(--teal); text-align:center; width:140px; border:none; padding:2px; margin-bottom:0;" />
+        <input type="number" min="0" id="simAmountInput" value="1000" style="font-size:28px; font-weight:600; color:var(--teal); text-align:center; width:140px; border:none; padding:2px; margin-bottom:0;" />
       </div>
       <input type="range" id="simSlider" min="0" max="${Math.max(disponible() * 2, 3000)}" step="50" value="1000" style="width:100%; margin-bottom:16px;" />
       <div class="row-between" style="background:white; border-radius:10px; padding:10px 12px; margin-bottom:8px;">
@@ -910,7 +910,7 @@ function tplIngreso() {
     </div>
 
     <label id="ingAmountLabel">${freq === "biweekly" ? "¿Cuánto ganás cada quincena?" : "¿Cuánto ganás al mes?"}</label>
-    <input id="ingAmount" type="number" value="${state.profile.declared_monthly_income ?? ""}" style="margin-bottom:16px;" />
+    <input id="ingAmount" type="number" min="0" value="${state.profile.declared_monthly_income ?? ""}" style="margin-bottom:16px;" />
 
     <div class="error-banner" id="ingErr"></div>
     <button class="btn-primary" id="saveIngresoBtn" style="width:100%;">Guardar</button>
@@ -1025,8 +1025,8 @@ function tplMetas() {
     }
     <div style="margin-top:14px;">
       <input id="newGName" placeholder="Ej. Laptop nueva" style="margin-bottom:8px;" />
-      <input id="newGAmount" type="number" placeholder="Monto objetivo" style="margin-bottom:8px;" />
-      <input id="newGMonths" type="number" placeholder="¿En cuántos meses?" style="margin-bottom:8px;" />
+      <input id="newGAmount" type="number" min="0" placeholder="Monto objetivo" style="margin-bottom:8px;" />
+      <input id="newGMonths" type="number" min="0" placeholder="¿En cuántos meses?" style="margin-bottom:8px;" />
       <button class="btn-secondary" id="addGoalBtn" style="width:100%;">+ Agregar meta</button>
     </div>
   `;
@@ -1068,7 +1068,7 @@ function fixedAddForm() {
         <option value="" selected>Elegí una categoría</option>
         ${categories.map(c => `<option value="${c.id}">${c.name}</option>`).join("")}
       </select>
-      <input id="newFAmount" type="number" placeholder="RD$0" style="margin-bottom:8px;" />
+      <input id="newFAmount" type="number" min="0" placeholder="RD$0" style="margin-bottom:8px;" />
       <button class="btn-secondary" id="addFixedTabBtn" style="width:100%;">+ Agregar gasto fijo</button>
     </div>
   `;
@@ -1126,11 +1126,11 @@ function debtAddForm() {
         <option value="" selected>Elegí un tipo</option>
         ${DEBT_TYPES.map(t => `<option value="${t.value}">${t.icon} ${t.label}</option>`).join("")}
       </select>
-      <input id="newDAmount" type="number" placeholder="Monto total de la deuda" style="margin-bottom:8px;" />
+      <input id="newDAmount" type="number" min="0" placeholder="Monto total de la deuda" style="margin-bottom:8px;" />
       <label>Tasa de interés anual <span style="color:var(--text-muted);">(opcional, en %)</span></label>
-      <input id="newDInterest" type="number" placeholder="Ej. 45" style="margin-bottom:8px;" />
+      <input id="newDInterest" type="number" min="0" placeholder="Ej. 45" style="margin-bottom:8px;" />
       <label>¿En cuántas cuotas planeás pagarla? <span style="color:var(--text-muted);">(opcional)</span></label>
-      <input id="newDInstallments" type="number" placeholder="Ej. 10" style="margin-bottom:8px;" />
+      <input id="newDInstallments" type="number" min="0" placeholder="Ej. 10" style="margin-bottom:8px;" />
       <button class="btn-secondary" id="addDebtBtn" style="width:100%;">+ Agregar deuda</button>
     </div>
   `;
@@ -1156,12 +1156,12 @@ function tplPresupuestos() {
             <p style="font-size:11px; color:var(--text-muted); margin:0 0 6px;">${money(spent)} de ${money(budget.amount)} este mes</p>
             <div class="progress-bar"><div class="progress-fill" style="width:${pct}%; background:${pct >= 100 ? 'var(--danger-text)' : 'var(--gold)'};"></div></div>
             <div style="display:flex; gap:6px; margin-top:8px;">
-              <input type="number" placeholder="Nuevo monto" id="budgetEditInput-${c.id}" style="margin-bottom:0;" />
+              <input type="number" min="0" placeholder="Nuevo monto" id="budgetEditInput-${c.id}" style="margin-bottom:0;" />
               <button data-update-budget="${budget.id}" data-update-cat="${c.id}" class="btn-secondary" style="white-space:nowrap;">Actualizar</button>
             </div>
           ` : `
             <div style="display:flex; gap:6px;">
-              <input type="number" placeholder="RD$0" id="budgetInput-${c.id}" style="margin-bottom:0;" />
+              <input type="number" min="0" placeholder="RD$0" id="budgetInput-${c.id}" style="margin-bottom:0;" />
               <button data-set-budget="${c.id}" class="btn-secondary" style="white-space:nowrap;">Fijar</button>
             </div>
           `}
@@ -1211,7 +1211,7 @@ function wireTabEvents() {
     const name = document.getElementById("newGName").value.trim();
     const amount = document.getElementById("newGAmount").value;
     const months = document.getElementById("newGMonths").value;
-    if (!name || !amount || !months) { alert("Completá el nombre, el monto y el plazo."); return; }
+    if (!name || Number(amount) <= 0 || Number(months) <= 0) { alert("Completá el nombre, el monto y el plazo (mayores a cero)."); return; }
     const { error } = await supabase.from("goals").insert({
       user_id: user.id, name, target_amount: Number(amount), target_months: Number(months),
       linked_account_id: state.account.id, priority: "important",
@@ -1329,6 +1329,7 @@ function wireTabEvents() {
     const interest = document.getElementById("newDInterest").value;
     const installments = document.getElementById("newDInstallments").value;
     if (!name || !debtType || !amount) { alert("Completá el nombre, el tipo y el monto."); return; }
+    if (interest && Number(interest) < 0) { alert("La tasa de interés no puede ser negativa."); return; }
     const minimumPayment = installments && Number(installments) > 0
       ? Number(amount) / Number(installments)
       : null;
@@ -1365,7 +1366,7 @@ function openEditDebtModal(debtId) {
         ${DEBT_TYPES.map(t => `<option value="${t.value}" ${d.debt_type === t.value ? "selected" : ""}>${t.icon} ${t.label}</option>`).join("")}
       </select>
       <label>Tasa de interés anual (%)</label>
-      <input id="edInterest" type="number" value="${d.interest_rate ?? ""}" style="margin-bottom:16px;" />
+      <input id="edInterest" type="number" min="0" value="${d.interest_rate ?? ""}" style="margin-bottom:16px;" />
       <div class="btn-row">
         <button class="btn-secondary" id="cancelEditDebt">Cancelar</button>
         <button class="btn-primary" id="saveEditDebt">Guardar</button>
@@ -1378,6 +1379,7 @@ function openEditDebtModal(debtId) {
     const debtType = document.getElementById("edType").value;
     const interest = document.getElementById("edInterest").value;
     if (!name) { alert("El nombre no puede quedar vacío."); return; }
+    if (interest && Number(interest) < 0) { alert("La tasa de interés no puede ser negativa."); return; }
     await supabase.from("debts").update({
       name, debt_type: debtType, interest_rate: interest ? Number(interest) : null,
     }).eq("id", debtId);
@@ -1404,7 +1406,7 @@ function openEditFixedModal(fixedId) {
         ${categories.map(c => `<option value="${c.id}" ${f.category_id === c.id ? "selected" : ""}>${c.name}</option>`).join("")}
       </select>
       <label>Monto mensual</label>
-      <input id="efAmount" type="number" value="${f.estimated_amount}" style="margin-bottom:16px;" />
+      <input id="efAmount" type="number" min="0" value="${f.estimated_amount}" style="margin-bottom:16px;" />
       <div class="btn-row">
         <button class="btn-secondary" id="cancelEditFixed">Cancelar</button>
         <button class="btn-primary" id="saveEditFixed">Guardar</button>
@@ -1439,7 +1441,7 @@ function openEditTxModal(txId) {
     modal.innerHTML = `
       <div class="modal-box">
         <p class="step-label">Editar gasto</p>
-        <input id="etAmount" type="number" value="${Math.abs(t.amount)}" style="text-align:center; font-size:24px; margin-bottom:14px;" />
+        <input id="etAmount" type="number" min="0" value="${Math.abs(t.amount)}" style="text-align:center; font-size:24px; margin-bottom:14px;" />
         <label>Categoría</label>
         <div class="cat-grid">
           ${categories.map(c => `<div class="cat-option ${selectedCat === c.id ? "selected" : ""}" data-cat="${c.id}">${CATEGORY_ICONS[c.name] || "•"}<br>${c.name}</div>`).join("")}
@@ -1481,7 +1483,7 @@ function openPayDebtModal(debtId) {
       <p class="step-label">Registrar pago — ${esc(d.name)}</p>
       <p style="font-size:12px; color:var(--text-muted); text-align:center; margin:0 0 14px;">Debés ${money(d.current_balance)} ahora mismo.</p>
       <label>Monto que pagaste</label>
-      <input id="payAmount" type="number" value="${d.minimum_payment ? d.minimum_payment : ""}" style="margin-bottom:16px;" />
+      <input id="payAmount" type="number" min="0" value="${d.minimum_payment ? d.minimum_payment : ""}" style="margin-bottom:16px;" />
       <div class="error-banner" id="payErr"></div>
       <div class="btn-row">
         <button class="btn-secondary" id="cancelPay">Cancelar</button>
@@ -1549,9 +1551,9 @@ function openEditGoalModal(goalId) {
       <label>Nombre</label>
       <input id="egName" value="${esc(g.name)}" style="margin-bottom:10px;" />
       <label>Monto objetivo</label>
-      <input id="egAmount" type="number" value="${g.target_amount}" style="margin-bottom:10px;" />
+      <input id="egAmount" type="number" min="0" value="${g.target_amount}" style="margin-bottom:10px;" />
       <label>Plazo (meses)</label>
-      <input id="egMonths" type="number" value="${g.target_months}" style="margin-bottom:10px;" />
+      <input id="egMonths" type="number" min="0" value="${g.target_months}" style="margin-bottom:10px;" />
       <label>Prioridad</label>
       <select id="egPriority" style="margin-bottom:16px;">
         <option value="critical" ${g.priority === "critical" ? "selected" : ""}>Crítica</option>
@@ -1570,7 +1572,7 @@ function openEditGoalModal(goalId) {
     const amount = Number(document.getElementById("egAmount").value);
     const months = Number(document.getElementById("egMonths").value);
     const priority = document.getElementById("egPriority").value;
-    if (!name || !amount || !months) { alert("Completá todos los campos."); return; }
+    if (!name || amount <= 0 || months <= 0) { alert("El monto y el plazo tienen que ser mayores a cero."); return; }
     await supabase.from("goals").update({ name, target_amount: amount, target_months: months, priority }).eq("id", goalId);
     modal.classList.remove("visible"); modal.innerHTML = "";
     await loadState(); renderApp();
@@ -1600,7 +1602,7 @@ function openIncomeModal() {
       <div class="modal-box">
         <p class="step-label">Nuevo ingreso</p>
         <p style="font-size:12px; color:var(--text-muted); text-align:center; margin:0 0 14px;">Ej. tu sueldo, un pago que te hicieron, una remesa.</p>
-        <input id="incLogAmount" type="number" placeholder="RD$0" style="text-align:center; font-size:24px; margin-bottom:6px;" />
+        <input id="incLogAmount" type="number" min="0" placeholder="RD$0" style="text-align:center; font-size:24px; margin-bottom:6px;" />
         <input id="incLogNote" placeholder="Nota (opcional, ej. Sueldo julio)" style="margin-bottom:16px;" />
         <div class="btn-row">
           <button class="btn-secondary" id="cancelIncLog">Cancelar</button>
@@ -1648,7 +1650,7 @@ function openLogModal() {
     modal.innerHTML = `
       <div class="modal-box">
         <p class="step-label">Nuevo gasto</p>
-        <input id="logAmount" type="number" placeholder="RD$0" style="text-align:center; font-size:24px; margin-bottom:14px;" />
+        <input id="logAmount" type="number" min="0" placeholder="RD$0" style="text-align:center; font-size:24px; margin-bottom:14px;" />
         <label>Categoría</label>
         <div class="cat-grid">
           ${categories.map(c => `<div class="cat-option ${selectedCat === c.id ? "selected" : ""}" data-cat="${c.id}">${CATEGORY_ICONS[c.name] || "•"}<br>${c.name}</div>`).join("")}
