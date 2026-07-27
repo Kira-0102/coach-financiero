@@ -179,7 +179,8 @@ button {
   color: var(--teal);
   font-size: 13px;
   text-decoration: underline;
-  padding: 0;
+  padding: 10px 6px;
+  margin: -10px -6px;
 }
 
 /* -------- app principal (post-onboarding) -------- */
