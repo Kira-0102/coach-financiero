@@ -184,6 +184,14 @@ function goalMonthlyPace(g) {
 
 // Suma el ritmo mensual necesario de TODAS las metas activas — porque
 // todas compiten por el mismo disponible, no alcanza con mirar una sola.
+function goalMonthsLeft(g) {
+  if (!g || !g.target_months) return 0;
+  const created = new Date(g.created_at);
+  const now = new Date();
+  const elapsed = (now.getFullYear() - created.getFullYear()) * 12 + (now.getMonth() - created.getMonth());
+  return Math.max(0, g.target_months - elapsed);
+}
+
 function totalGoalMonthlyPace() {
   return state.goals.reduce((sum, g) => sum + goalMonthlyPace(g), 0);
 }
@@ -279,8 +287,11 @@ function renderOnboardingAccount() {
   root.innerHTML = `
     <div class="screen">
       <p class="step-label">Paso 1 de 4</p>
-      <h1>Agregá tu primera cuenta</h1>
+      <h1>Antes de empezar, ¿cómo te llamás?</h1>
       <div class="error-banner" id="err"></div>
+
+      <label>Tu nombre</label>
+      <input id="accUserName" placeholder="Ej. Luis" style="margin-bottom:14px;" value="${state.profile?.display_name ? esc(state.profile.display_name) : ""}" />
 
       <label>Nombre de la cuenta</label>
       <input id="accName" placeholder="Ej. Banreservas" style="margin-bottom:2px;" value="${existing ? esc(existing.name) : ""}" />
@@ -310,15 +321,23 @@ function renderOnboardingAccount() {
   });
 
   document.getElementById("continueBtn").addEventListener("click", async () => {
+    const userName = document.getElementById("accUserName").value.trim();
     const name = document.getElementById("accName").value.trim();
     const balanceVal = document.getElementById("accBalance").value;
     const errEl = document.getElementById("err");
+    if (!userName) {
+      errEl.textContent = "Completá tu nombre.";
+      errEl.classList.add("visible");
+      return;
+    }
     if (!name) {
       errEl.textContent = "Completá el nombre de la cuenta.";
       errEl.classList.add("visible");
       return;
     }
     const balanceNum = balanceVal === "" ? 0 : Number(balanceVal);
+    // Guardar el nombre del usuario
+    await supabase.from("profiles").update({ display_name: userName }).eq("id", user.id);
     // Si ya existe una cuenta (volviste desde un paso más adelante),
     // la actualizamos en vez de crear una segunda por accidente.
     const { error } = existing
@@ -631,7 +650,7 @@ function backLink() {
 
 function tplMas() {
   const items = [
-    { tab: "ingreso", icon: "💰", label: "Ingreso", desc: "Cuánto ganás y con qué frecuencia" },
+    { tab: "ingreso", icon: "💰", label: "Perfil e ingreso", desc: "Tu nombre y cuánto ganás" },
     { tab: "gastos", icon: "🧾", label: "Gastos", desc: "Ver, editar y borrar tus movimientos" },
     { tab: "metas", icon: "🎯", label: "Metas", desc: "Tus objetivos de ahorro" },
     { tab: "fijos", icon: "💳", label: "Gastos fijos", desc: "Lo que se repite cada mes" },
@@ -760,9 +779,9 @@ function tplSimular() {
 
       <div style="display:flex; align-items:center; justify-content:center; gap:6px; margin-bottom:6px;">
         <span style="font-size:28px; font-weight:600; color:var(--teal);">RD$</span>
-        <input type="number" step="1" min="0" id="simAmountInput" value="1000" style="font-size:28px; font-weight:600; color:var(--teal); text-align:center; width:140px; border:none; padding:2px; margin-bottom:0;" />
+        <input type="number" step="1" min="0" id="simAmountInput" value="" placeholder="0" style="font-size:28px; font-weight:600; color:var(--teal); text-align:center; width:140px; border:none; padding:2px; margin-bottom:0;" />
       </div>
-      <input type="range" id="simSlider" min="0" max="${Math.max(disponible() * 2, 3000)}" step="50" value="1000" style="width:100%; margin-bottom:16px;" />
+      <input type="range" id="simSlider" min="0" max="${Math.max(disponible() * 2, 3000)}" step="50" value="0" style="width:100%; margin-bottom:16px;" />
       <div class="row-between" style="background:white; border-radius:10px; padding:10px 12px; margin-bottom:8px;">
         <span style="font-size:12px; color:var(--text-secondary);">Saldo real ahora</span>
         <span style="font-size:12px; font-weight:500;">${money(balance())}</span>
@@ -777,7 +796,7 @@ function tplSimular() {
       </div>
       <div class="row-between" style="background:white; border-radius:10px; padding:10px 12px;">
         <span style="font-size:12px; color:var(--text-secondary);">Te quedaría (según tu plan)</span>
-        <span id="simRemaining" style="font-size:12px; font-weight:500;">${money(disponible() - spentThisMonthTotal() - 1000)}</span>
+        <span id="simRemaining" style="font-size:12px; font-weight:500;">${money(disponible() - spentThisMonthTotal())}</span>
       </div>
       <div id="simBalanceWarning" style="display:none;"></div>
       ${goalLabel ? `
@@ -839,7 +858,7 @@ function wireSimulador() {
 
   slider.addEventListener("input", () => update(slider.value));
   amountInput.addEventListener("input", () => update(amountInput.value));
-  update(1000);
+  update(0);
 
   const askCoachBtn = document.getElementById("askCoachBtn");
   if (askCoachBtn) askCoachBtn.addEventListener("click", () => {
@@ -874,7 +893,7 @@ function tplInicio() {
   return `
     <div class="top-bar">
       <div>
-        <p class="name">Hola</p>
+        <p class="name">Hola${state.profile?.display_name ? ", " + esc(state.profile.display_name) : ""}</p>
         <p class="date">${new Date().toLocaleDateString("es-DO", { weekday: "long", day: "numeric", month: "long" })}</p>
       </div>
       <div class="avatar">👤</div>
@@ -909,7 +928,7 @@ function tplInicio() {
             <span style="color:var(--text-muted);">›</span>
           </span>
         </div>
-        <p style="font-size:11px; color:var(--text-muted); margin:0 0 6px;">${money(g.current_amount)} de ${money(g.target_amount)} · ${g.target_months} meses</p>
+        <p style="font-size:11px; color:var(--text-muted); margin:0 0 6px;">${money(g.current_amount)} de ${money(g.target_amount)} · ${goalMonthsLeft(g) > 0 ? "Faltan " + goalMonthsLeft(g) + " meses" : "Plazo cumplido"}</p>
         <div class="progress-bar"><div class="progress-fill" style="width:${progressPct}%;"></div></div>
       </div>
       ${state.goals.length > 1 ? `<p style="font-size:11px; color:var(--text-muted); margin:-4px 0 10px; text-align:center;">+${state.goals.length - 1} meta${state.goals.length > 2 ? "s" : ""} más</p>` : ""}
@@ -928,15 +947,17 @@ function tplInicio() {
       <button class="fab" id="openLogBtn" style="margin:0;">+ Gasto</button>
       <button class="btn-secondary" id="openIncomeBtn" style="flex:1; padding:13px;">+ Ingreso</button>
     </div>
-    <p style="text-align:center; margin-top:-8px;"><button class="link-btn" id="logoutBtn" style="font-size:11px;">Cerrar sesión</button></p>
   `;
 }
 
 function tplIngreso() {
   const freq = state.profile.pay_frequency || "monthly";
   return `
-    <h1 style="text-align:left; margin-bottom:4px;">Tu ingreso</h1>
-    <p style="font-size:11px; color:var(--text-muted); margin:0 0 16px;">Esto afecta cuánto te dice la app que tenés disponible cada mes.</p>
+    <h1 style="text-align:left; margin-bottom:4px;">Tu perfil</h1>
+    <p style="font-size:11px; color:var(--text-muted); margin:0 0 16px;">Tu nombre y cuánto ganás. Esto afecta todos los cálculos de la app.</p>
+
+    <label>Tu nombre</label>
+    <input id="ingName" value="${state.profile?.display_name ? esc(state.profile.display_name) : ""}" placeholder="Ej. Luis" style="margin-bottom:14px;" />
 
     <label>¿Con qué frecuencia cobrás?</label>
     <div class="type-grid" style="grid-template-columns:1fr 1fr; margin-bottom:14px;" id="ingFreqGrid">
@@ -968,6 +989,7 @@ function wireIngreso() {
   });
 
   document.getElementById("saveIngresoBtn").addEventListener("click", async () => {
+    const displayName = document.getElementById("ingName").value.trim();
     const amount = document.getElementById("ingAmount").value;
     const errEl = document.getElementById("ingErr");
     if (!amount || Number(amount) <= 0) {
@@ -976,6 +998,7 @@ function wireIngreso() {
       return;
     }
     const { error } = await supabase.from("profiles").update({
+      display_name: displayName || null,
       declared_monthly_income: Number(amount), pay_frequency: selectedFreq,
     }).eq("id", user.id);
     if (error) {
@@ -1049,7 +1072,7 @@ function tplMetas() {
           </div>
         </div>
         <div style="display:inline-block; font-size:10px; border-radius:10px; padding:2px 8px; margin-bottom:8px; background:${stLabel.bg}; color:${stLabel.color};">${stLabel.text}</div>
-        <p style="font-size:11px; color:var(--text-muted); margin:0 0 6px;">${money(g.current_amount)} de ${money(g.target_amount)} · ${g.target_months} meses</p>
+        <p style="font-size:11px; color:var(--text-muted); margin:0 0 6px;">${money(g.current_amount)} de ${money(g.target_amount)} · ${goalMonthsLeft(g) > 0 ? "Faltan " + goalMonthsLeft(g) + " meses" : "Plazo cumplido"}</p>
         <div class="progress-bar"><div class="progress-fill" style="width:${progressPct}%; background:${done ? 'var(--success-text)' : 'var(--gold)'};"></div></div>
         ${done
           ? `<p style="font-size:11px; color:var(--success-text); margin:8px 0 0;">Llegaste a tu objetivo 🎉</p>`
@@ -1068,12 +1091,7 @@ function tplMetas() {
       ? `<div class="empty-state"><div class="icon-circle">🎯</div><p style="font-size:13px; color:var(--text-muted);">Todavía no creaste ninguna meta.</p></div>`
       : list
     }
-    <div style="margin-top:14px;">
-      <input id="newGName" placeholder="Ej. Laptop nueva" style="margin-bottom:8px;" />
-      <input id="newGAmount" type="number" step="1" min="0" placeholder="Monto objetivo" style="margin-bottom:8px;" />
-      <input id="newGMonths" type="number" step="1" min="0" placeholder="¿En cuántos meses?" style="margin-bottom:8px;" />
-      <button class="btn-secondary" id="addGoalBtn" style="width:100%;">+ Agregar meta</button>
-    </div>
+    <button class="btn-secondary" id="openNewGoalBtn" style="width:100%; margin-top:14px;">+ Nueva meta</button>
   `;
 }
 
@@ -1238,12 +1256,6 @@ function wireTabEvents() {
   const gastosAddIncomeBtn = document.getElementById("gastosAddIncomeBtn");
   if (gastosAddIncomeBtn) gastosAddIncomeBtn.addEventListener("click", openIncomeModal);
 
-  const logoutBtn = document.getElementById("logoutBtn");
-  if (logoutBtn) logoutBtn.addEventListener("click", async () => {
-    await supabase.auth.signOut();
-    window.location.href = "index.html";
-  });
-
   const logoutBtnMas = document.getElementById("logoutBtnMas");
   if (logoutBtnMas) logoutBtnMas.addEventListener("click", async () => {
     await supabase.auth.signOut();
@@ -1257,23 +1269,8 @@ function wireTabEvents() {
     btn.addEventListener("click", () => { tab = btn.dataset.masItem; renderApp(); });
   });
 
-  const addGoalBtn = document.getElementById("addGoalBtn");
-  if (addGoalBtn) addGoalBtn.addEventListener("click", async () => {
-    const name = document.getElementById("newGName").value.trim();
-    const amount = document.getElementById("newGAmount").value;
-    const months = document.getElementById("newGMonths").value;
-    if (!name || Number(amount) <= 0 || Number(months) <= 0) { alert("Completá el nombre, el monto y el plazo (mayores a cero)."); return; }
-    const yaExiste = state.goals.some(g => g.name.trim().toLowerCase() === name.toLowerCase());
-    if (yaExiste && !confirm(`Ya tenés una meta llamada "${name}". ¿Querés crear otra igual de todos modos?`)) return;
-    addGoalBtn.disabled = true;
-    addGoalBtn.textContent = "Guardando…";
-    const { error } = await supabase.from("goals").insert({
-      user_id: user.id, name, target_amount: Number(amount), target_months: Number(months),
-      linked_account_id: state.account.id, priority: "important",
-    });
-    if (error) { alert("No se pudo guardar. Intentá de nuevo."); addGoalBtn.disabled = false; addGoalBtn.textContent = "+ Agregar meta"; return; }
-    await loadState(); renderApp();
-  });
+  const openNewGoalBtn = document.getElementById("openNewGoalBtn");
+  if (openNewGoalBtn) openNewGoalBtn.addEventListener("click", openNewGoalModal);
 
   document.querySelectorAll("[data-del-goal]").forEach(btn => {
     btn.addEventListener("click", async () => {
@@ -1435,9 +1432,18 @@ function openEditDebtModal(debtId) {
     const interest = document.getElementById("edInterest").value;
     if (!name) { alert("El nombre no puede quedar vacío."); return; }
     if (interest && Number(interest) < 0) { alert("La tasa de interés no puede ser negativa."); return; }
-    await supabase.from("debts").update({
+    const saveBtn = document.getElementById("saveEditDebt");
+    saveBtn.disabled = true;
+    saveBtn.textContent = "Guardando…";
+    const { error } = await supabase.from("debts").update({
       name, debt_type: debtType, interest_rate: interest ? Number(interest) : null,
     }).eq("id", debtId);
+    if (error) {
+      alert("No se pudo guardar. Intentá de nuevo.");
+      saveBtn.disabled = false;
+      saveBtn.textContent = "Guardar";
+      return;
+    }
     modal.classList.remove("visible"); modal.innerHTML = "";
     await loadState(); renderApp();
     showToast("Deuda actualizada");
@@ -1474,9 +1480,18 @@ function openEditFixedModal(fixedId) {
     const catId = document.getElementById("efCat").value;
     const amount = document.getElementById("efAmount").value;
     if (!name || !amount) { alert("Completá el nombre y el monto."); return; }
-    await supabase.from("recurring_expense_templates").update({
+    const saveBtn = document.getElementById("saveEditFixed");
+    saveBtn.disabled = true;
+    saveBtn.textContent = "Guardando…";
+    const { error } = await supabase.from("recurring_expense_templates").update({
       name, category_id: catId, estimated_amount: Number(amount),
     }).eq("id", fixedId);
+    if (error) {
+      alert("No se pudo guardar. Intentá de nuevo.");
+      saveBtn.disabled = false;
+      saveBtn.textContent = "Guardar";
+      return;
+    }
     modal.classList.remove("visible"); modal.innerHTML = "";
     await loadState(); renderApp();
     showToast("Gasto fijo actualizado");
@@ -1508,7 +1523,11 @@ function openEditTxModal(txId) {
       </div>
     `;
     document.querySelectorAll(".cat-option").forEach(el => {
-      el.addEventListener("click", () => { selectedCat = el.dataset.cat; paint(); });
+      el.addEventListener("click", () => {
+        selectedCat = el.dataset.cat;
+        document.querySelectorAll(".cat-option").forEach(c => c.classList.remove("selected"));
+        el.classList.add("selected");
+      });
     });
     document.getElementById("cancelEditTx").addEventListener("click", () => { modal.classList.remove("visible"); modal.innerHTML = ""; });
     document.getElementById("saveEditTx").addEventListener("click", async () => {
@@ -1590,6 +1609,68 @@ function openPayDebtModal(debtId) {
     modal.classList.remove("visible"); modal.innerHTML = "";
     await loadState(); renderApp();
     showToast("Pago registrado");
+  });
+}
+
+// ---------------------------------------------------------------
+// MODAL: NUEVA META (con selector de prioridad)
+// ---------------------------------------------------------------
+function openNewGoalModal() {
+  const modal = document.getElementById("logModal");
+  modal.classList.add("visible");
+  modal.innerHTML = `
+    <div class="modal-box">
+      <p class="step-label">Nueva meta</p>
+      <label>¿Cómo la llamamos?</label>
+      <input id="ngName" placeholder="Ej. Laptop nueva" style="margin-bottom:10px;" />
+      <label>Monto objetivo</label>
+      <input id="ngAmount" type="number" step="1" min="0" placeholder="RD$0" style="margin-bottom:10px;" />
+      <label>¿En cuántos meses?</label>
+      <input id="ngMonths" type="number" step="1" min="0" placeholder="Ej. 6" style="margin-bottom:10px;" />
+      <label>Prioridad</label>
+      <select id="ngPriority" style="margin-bottom:16px;">
+        <option value="critical">Crítica</option>
+        <option value="important" selected>Importante</option>
+        <option value="optional">Opcional</option>
+      </select>
+      <div class="error-banner" id="ngErr"></div>
+      <div class="btn-row">
+        <button class="btn-secondary" id="cancelNewGoal">Cancelar</button>
+        <button class="btn-primary" id="saveNewGoal">Crear meta</button>
+      </div>
+    </div>
+  `;
+  document.getElementById("cancelNewGoal").addEventListener("click", () => { modal.classList.remove("visible"); modal.innerHTML = ""; });
+  document.getElementById("saveNewGoal").addEventListener("click", async () => {
+    const name = document.getElementById("ngName").value.trim();
+    const amount = Number(document.getElementById("ngAmount").value);
+    const months = Number(document.getElementById("ngMonths").value);
+    const priority = document.getElementById("ngPriority").value;
+    const errEl = document.getElementById("ngErr");
+    if (!name || amount <= 0 || months <= 0) {
+      errEl.textContent = "Completá todos los campos (mayores a cero).";
+      errEl.classList.add("visible");
+      return;
+    }
+    const yaExiste = state.goals.some(g => g.name.trim().toLowerCase() === name.toLowerCase());
+    if (yaExiste && !confirm(`Ya tenés una meta llamada "${name}". ¿Querés crear otra igual?`)) return;
+    const saveBtn = document.getElementById("saveNewGoal");
+    saveBtn.disabled = true;
+    saveBtn.textContent = "Guardando…";
+    const { error } = await supabase.from("goals").insert({
+      user_id: user.id, name, target_amount: amount, target_months: months,
+      linked_account_id: state.account.id, priority,
+    });
+    if (error) {
+      errEl.textContent = "No se pudo guardar. Intentá de nuevo.";
+      errEl.classList.add("visible");
+      saveBtn.disabled = false;
+      saveBtn.textContent = "Crear meta";
+      return;
+    }
+    modal.classList.remove("visible"); modal.innerHTML = "";
+    await loadState(); renderApp();
+    showToast("Meta creada");
   });
 }
 
@@ -1688,6 +1769,7 @@ function openEditGoalModal(goalId) {
         <option value="important" ${g.priority === "important" ? "selected" : ""}>Importante</option>
         <option value="optional" ${g.priority === "optional" ? "selected" : ""}>Opcional</option>
       </select>
+      <div class="error-banner" id="egErr"></div>
       <div class="btn-row">
         <button class="btn-secondary" id="cancelEdit">Cancelar</button>
         <button class="btn-primary" id="saveEdit">Guardar</button>
@@ -1701,7 +1783,18 @@ function openEditGoalModal(goalId) {
     const months = Number(document.getElementById("egMonths").value);
     const priority = document.getElementById("egPriority").value;
     if (!name || amount <= 0 || months <= 0) { alert("El monto y el plazo tienen que ser mayores a cero."); return; }
-    await supabase.from("goals").update({ name, target_amount: amount, target_months: months, priority }).eq("id", goalId);
+    const saveBtn = document.getElementById("saveEdit");
+    saveBtn.disabled = true;
+    saveBtn.textContent = "Guardando…";
+    const { error } = await supabase.from("goals").update({ name, target_amount: amount, target_months: months, priority }).eq("id", goalId);
+    if (error) {
+      const errEl = document.getElementById("egErr");
+      errEl.textContent = "No se pudo guardar. Intentá de nuevo.";
+      errEl.classList.add("visible");
+      saveBtn.disabled = false;
+      saveBtn.textContent = "Guardar";
+      return;
+    }
     modal.classList.remove("visible"); modal.innerHTML = "";
     await loadState(); renderApp();
     showToast("Meta actualizada");
@@ -1799,7 +1892,11 @@ function openLogModal() {
     `;
 
     document.querySelectorAll(".cat-option").forEach(el => {
-      el.addEventListener("click", () => { selectedCat = el.dataset.cat; paint(); });
+      el.addEventListener("click", () => {
+        selectedCat = el.dataset.cat;
+        document.querySelectorAll(".cat-option").forEach(c => c.classList.remove("selected"));
+        el.classList.add("selected");
+      });
     });
     document.getElementById("cancelLog").addEventListener("click", () => { modal.classList.remove("visible"); modal.innerHTML = ""; });
     document.getElementById("saveLog").addEventListener("click", async () => {
