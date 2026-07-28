@@ -143,9 +143,9 @@ async function loadState() {
       supabase.from("goals").select("*").order("created_at"),
       supabase.from("recurring_expense_templates").select("*, categories(name)").eq("active", true).order("created_at"),
       supabase.from("debts").select("*").order("created_at"),
-      // Sin límite: el saldo se calcula sumando TODAS las transacciones.
-      // Con un límite, el saldo quedaría mal apenas se superen esas filas.
-      supabase.from("transactions").select("*, categories(name)").order("occurred_at", { ascending: false }),
+      // P8: el saldo real viene de accounts.computed_balance (trigger de BD).
+      // Limitamos transacciones a 150 para la UI — suficiente para historial reciente.
+      supabase.from("transactions").select("*, categories(name)").order("occurred_at", { ascending: false }).limit(150),
       supabase.from("budgets").select("*, categories(name)").is("effective_to", null),
     ]);
 
@@ -164,7 +164,15 @@ function spentThisMonthTotal() {
   const now = new Date();
   const start = new Date(now.getFullYear(), now.getMonth(), 1);
   return state.transactions
-    .filter(t => new Date(t.occurred_at) >= start && Number(t.amount) < 0)
+    .filter(t => {
+      if (new Date(t.occurred_at) < start) return false;
+      if (Number(t.amount) >= 0) return false; // ingresos no cuentan
+      // Los aportes a metas y pagos de deuda son transferencias de ahorro,
+      // no gastos variables. Se excluyen para no restar dos veces el ahorro.
+      const note = t.note || "";
+      if (!t.category_id && (note.startsWith("Aporte:") || note.startsWith("Pago:"))) return false;
+      return true;
+    })
     .reduce((s, t) => s + Math.abs(Number(t.amount)), 0);
 }
 
@@ -218,10 +226,15 @@ function totalGoalMonthlyPace() {
 // P6: deriva el estado visible de una meta. 'completed' si ya llegó;
 // 'at_risk' si el ritmo requerido supera holgadamente lo disponible.
 function goalStatus(g) {
-  if (Number(g.current_amount) >= Number(g.target_amount)) return "completed";
+  // P3: respetar el status guardado en la BD para metas completadas.
+  // Solo recalcular active/at_risk para las que aún están en curso.
+  if (g.status === "completed" || Number(g.current_amount) >= Number(g.target_amount)) return "completed";
   const pace = goalMonthlyPace(g);
-  const disp = disponible();
-  if (disp > 0 && pace > disp) return "at_risk";
+  // P11: usar disponible restante real (ingreso - fijos - gastos variables del mes).
+  // Los aportes a metas ya están excluidos de spentThisMonthTotal(), así que no
+  // se resta dos veces el dinero destinado al ahorro.
+  const dispRestante = disponible() - spentThisMonthTotal();
+  if (dispRestante > 0 && pace > dispRestante) return "at_risk";
   return "active";
 }
 
@@ -243,9 +256,10 @@ function disponible() {
   return monthlyIncome() - totalFixed();
 }
 function balance() {
+  // P8: computed_balance lo mantiene el trigger sync_account_balance en la BD.
+  // Ya no necesitamos recalcular sumando todas las transacciones en el cliente.
   if (!state.account) return 0;
-  const accountTx = state.transactions.filter(t => t.account_id === state.account.id);
-  return Number(state.account.initial_balance) + accountTx.reduce((s, t) => s + Number(t.amount), 0);
+  return Number(state.account.computed_balance ?? state.account.initial_balance);
 }
 
 function totalDebt() {
@@ -309,7 +323,7 @@ function renderOnboardingAccount() {
       <h1>Antes de empezar, ¿cómo te llamas?</h1>
       <div class="error-banner" id="err"></div>
 
-      <label>Tu nombre</label>
+      <label for="accUserName">Tu nombre</label>
       <input id="accUserName" placeholder="Ej. Luis" style="margin-bottom:14px;" value="${state.profile?.display_name ? esc(state.profile.display_name) : ""}" />
 
       <label>Nombre de la cuenta</label>
@@ -518,7 +532,13 @@ function renderOnboardingFixed() {
     });
 
     document.getElementById("backBtn").addEventListener("click", () => renderOnboardingIncome());
-    document.getElementById("continueBtn").addEventListener("click", () => renderOnboardingGoal());
+    document.getElementById("continueBtn").addEventListener("click", () => {
+      if (state.fixed.length === 0) {
+        const ok = confirm("Continuarás sin gastos fijos. Si tienes pagos recurrentes (renta, servicios, suscripciones), puedes agregarlos más tarde en Más → Gastos fijos para que tus cálculos sean exactos. ¿Continuar de todas formas?");
+        if (!ok) return;
+      }
+      renderOnboardingGoal();
+    });
   }
   paint();
 }
@@ -769,6 +789,9 @@ async function sendCoachMessage() {
   coachError = "";
   coachSending = true;
   coachHistory.push({ role: "user", content: msg });
+  // P4: limitar el historial en memoria a 20 mensajes (10 turnos).
+  // El slice al mandar ya limita a 10, pero sin esto el array crece indefinidamente.
+  if (coachHistory.length > 20) coachHistory = coachHistory.slice(-20);
   input.value = "";
   renderApp();
   const typingEl = document.getElementById("coachTyping");
@@ -900,7 +923,7 @@ function wireSimulador() {
   const askCoachBtn = document.getElementById("askCoachBtn");
   if (askCoachBtn) askCoachBtn.addEventListener("click", () => {
     const amount = Number(amountInput.value);
-    const itemName = document.getElementById("simItemName").value.trim();
+    const itemName = document.getElementById("simItemName").value.trim().replace(/"/g, "'").replace(/[<>]/g, "");
     const thing = itemName ? `en ${itemName}` : "en algo";
     let msg = `Estoy pensando en gastar ${money(amount)} ${thing}. Ya gasté ${money(alreadySpent)} este mes, así que con esto me quedarían ${money(disponible() - alreadySpent - amount)} de disponible.`;
     if (state.goals.length === 1) msg += ` ¿Cómo afecta esto a mi meta "${state.goals[0].name}"?`;
@@ -942,7 +965,7 @@ function tplInicio() {
       <div class="score-box">
         <p class="label">Situación</p>
         <p class="value" style="color:var(--teal);">${baseline !== null ? baseline : "—"}</p>
-        <p style="font-size:10px; color:var(--text-muted); margin:4px 0 0;">${balance() <= 0 ? "Estimado — cargá tu saldo para afinarlo" : "Según tu ingreso, deuda y ahorro"}</p>
+        <p style="font-size:10px; color:var(--text-muted); margin:4px 0 0;">${balance() <= 0 ? "Estimado — carga tu saldo para afinarlo" : "Según tu ingreso, deuda y ahorro"}</p>
       </div>
       <div class="score-box">
         <p class="label">Hábitos</p>
@@ -1001,7 +1024,7 @@ function tplIngreso() {
     <h1 style="text-align:left; margin-bottom:4px;">Tu perfil</h1>
     <p style="font-size:11px; color:var(--text-muted); margin:0 0 16px;">Tu nombre y cuánto ganas. Esto afecta todos los cálculos de la app.</p>
 
-    <label>Tu nombre</label>
+    <label for="ingName">Tu nombre</label>
     <input id="ingName" value="${state.profile?.display_name ? esc(state.profile.display_name) : ""}" placeholder="Ej. Luis" style="margin-bottom:14px;" />
 
     <label>¿Con qué frecuencia cobras?</label>
@@ -1225,7 +1248,7 @@ function tplDeudas() {
         </p>
         ${isPaidOff
           ? `<p style="font-size:13px; font-weight:600; color:var(--success-text); margin:0 0 4px;">✓ Deuda pagada</p>`
-          : `<p style="font-size:15px; font-weight:600; color:var(--teal); margin:0 0 4px;">Debés ${money(d.current_balance)}</p>`
+          : `<p style="font-size:15px; font-weight:600; color:var(--teal); margin:0 0 4px;">Debes ${money(d.current_balance)}</p>`
         }
         <p style="font-size:11px; color:var(--text-muted); margin:0 0 6px;">Pagaste ${money(paid)} de ${money(d.original_amount)}</p>
         <div class="progress-bar"><div class="progress-fill" style="width:${pct}%;"></div></div>
@@ -1246,7 +1269,7 @@ function debtAddForm() {
   return `
     <div style="margin-top:14px;">
       <input id="newDName" placeholder="Ej. Tarjeta Banco X" style="margin-bottom:8px;" />
-      <label>Tipo de deuda</label>
+      <label for="newDType">Tipo de deuda</label>
       <select id="newDType" style="margin-bottom:8px;">
         <option value="" selected>Elegí un tipo</option>
         ${DEBT_TYPES.map(t => `<option value="${t.value}">${t.icon} ${t.label}</option>`).join("")}
@@ -1343,8 +1366,32 @@ function wireTabEvents() {
 
   document.querySelectorAll("[data-del-goal]").forEach(btn => {
     btn.addEventListener("click", async () => {
-      if (!(await confirmAction("¿Borrar esta meta?"))) return;
-      await deleteLocal("goals", btn.dataset.delGoal, "goals");
+      const goalId = btn.dataset.delGoal;
+      const g = state.goals.find(x => x.id === goalId);
+
+      // P2: verificar si tiene aportes registrados
+      const { data: contribs } = await supabase
+        .from("goal_contributions").select("transaction_id, amount").eq("goal_id", goalId);
+
+      let confirmMsg = `¿Borrar la meta "${g?.name}"?`;
+      if (contribs && contribs.length > 0) {
+        const totalAportado = contribs.reduce((s, c) => s + Number(c.amount), 0);
+        confirmMsg = `¿Borrar la meta "${g?.name}"?\n\nTienes ${contribs.length} aporte(s) por ${money(totalAportado)} registrados. Las transacciones se conservan en tu historial como "Aporte: ${g?.name} (meta eliminada)".`;
+      }
+
+      if (!(await confirmAction(confirmMsg))) return;
+
+      // Renombrar las transacciones vinculadas para que el historial sea legible
+      if (contribs && contribs.length > 0) {
+        const txIds = contribs.map(c => c.transaction_id).filter(Boolean);
+        if (txIds.length > 0) {
+          await supabase.from("transactions")
+            .update({ note: `Aporte: ${g?.name} (meta eliminada)` })
+            .in("id", txIds);
+        }
+      }
+
+      await deleteLocal("goals", goalId, "goals");
     });
   });
 
@@ -1487,7 +1534,7 @@ function wireTabEvents() {
 
   document.querySelectorAll("[data-remove-budget]").forEach(btn => {
     btn.addEventListener("click", async () => {
-      if (!(await confirmAction("¿Quitar este presupuesto? Podés fijar uno nuevo cuando quieras."))) return;
+      if (!(await confirmAction("¿Quitar este presupuesto? Puedes fijar uno nuevo cuando quieras."))) return;
       await supabase.from("budgets").update({ effective_to: new Date().toISOString().slice(0, 10) }).eq("id", btn.dataset.removeBudget);
       await loadState(); renderApp();
     });
@@ -1675,7 +1722,7 @@ function openPayDebtModal(debtId) {
   modal.innerHTML = `
     <div class="modal-box">
       <p class="step-label">Registrar pago — ${esc(d.name)}</p>
-      <p style="font-size:12px; color:var(--text-muted); text-align:center; margin:0 0 14px;">Debés ${money(d.current_balance)} ahora mismo.</p>
+      <p style="font-size:12px; color:var(--text-muted); text-align:center; margin:0 0 14px;">Debes ${money(d.current_balance)} ahora mismo.</p>
       <label>Monto que pagaste</label>
       <input id="payAmount" type="number" step="1" min="0" value="${d.minimum_payment ? d.minimum_payment : ""}" style="margin-bottom:16px;" />
       <div class="error-banner" id="payErr"></div>
@@ -1888,12 +1935,21 @@ function openNewGoalModal() {
   modal.innerHTML = `
     <div class="modal-box">
       <p class="step-label">Nueva meta</p>
-      <label>¿Cómo la llamamos?</label>
+      <label for="ngName">¿Cómo la llamamos?</label>
       <input id="ngName" placeholder="Ej. Laptop nueva" style="margin-bottom:10px;" />
-      <label>Monto objetivo</label>
+      <label for="ngAmount">Monto objetivo</label>
       <input id="ngAmount" type="number" step="1" min="0" placeholder="RD$0" style="margin-bottom:10px;" />
-      <label>¿En cuántos meses?</label>
-      <input id="ngMonths" type="number" step="1" min="0" placeholder="Ej. 6" style="margin-bottom:10px;" />
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:4px;">
+        <div>
+          <label style="font-size:11px;">¿En cuántos meses?</label>
+          <input id="ngMonths" type="number" step="1" min="0" placeholder="Ej. 6" style="margin-bottom:0;" />
+        </div>
+        <div>
+          <label style="font-size:11px;">¿Cuánto puedes dar/mes? <span style="color:var(--text-muted);">(opcional)</span></label>
+          <input id="ngMonthly" type="number" step="1" min="0" placeholder="RD$0" style="margin-bottom:0;" />
+        </div>
+      </div>
+      <div id="ngPreview" style="margin:8px 0 10px;"></div>
       <label>Prioridad</label>
       <select id="ngPriority" style="margin-bottom:4px;">
         <option value="critical">🔴 Alta</option>
@@ -1908,32 +1964,94 @@ function openNewGoalModal() {
       </div>
     </div>
   `;
+
+  function updatePreview() {
+    const amount = Number(document.getElementById("ngAmount").value) || 0;
+    const months = Number(document.getElementById("ngMonths").value) || 0;
+    const monthly = Number(document.getElementById("ngMonthly").value) || 0;
+    const preview = document.getElementById("ngPreview");
+    if (!amount) { preview.innerHTML = ""; return; }
+
+    if (monthly > 0 && months <= 0) {
+      // Solo puso aporte — calcula el plazo
+      const mesesNecesarios = Math.ceil(amount / monthly);
+      const pct = Math.round((monthly / disponible()) * 100);
+      const color = pct > 50 ? "var(--warning-text)" : "var(--success-text)";
+      const bg = pct > 50 ? "var(--warning-bg)" : "var(--success-bg)";
+      preview.innerHTML = `<div class="card" style="background:${bg}; margin-top:4px;">
+        <p style="font-size:12px; color:${color}; margin:0; line-height:1.5;">
+          Con RD$${money(monthly).replace("RD$","")}/mes llegas en <strong>${mesesNecesarios} meses</strong> — ${pct}% de tu disponible.
+        </p></div>`;
+    } else if (months > 0) {
+      // Tiene plazo — calcula el aporte sugerido y compara con el que puso
+      const sugerido = Math.round(amount / months);
+      if (monthly > 0 && monthly < sugerido) {
+        const mesesReales = Math.ceil(amount / monthly);
+        preview.innerHTML = `<div class="card" style="background:var(--warning-bg); margin-top:4px;">
+          <p style="font-size:12px; color:var(--warning-text); margin:0; line-height:1.5;">
+            Con RD$${money(monthly).replace("RD$","")}/mes llegarás en <strong>${mesesReales} meses</strong>, no en ${months}. Para cumplirlo en ${months} meses necesitas <strong>${money(sugerido)}/mes</strong>.
+          </p></div>`;
+      } else if (monthly >= sugerido) {
+        preview.innerHTML = `<div class="card" style="background:var(--success-bg); margin-top:4px;">
+          <p style="font-size:12px; color:var(--success-text); margin:0;">
+            ✓ Con ese aporte llegas antes del plazo. Aporte mínimo necesario: ${money(sugerido)}/mes.
+          </p></div>`;
+      } else {
+        // Solo plazo, sin aporte manual
+        const disp = disponible();
+        const pct = disp > 0 ? Math.round((sugerido / disp) * 100) : null;
+        const color = pct === null || pct > 50 ? "var(--warning-text)" : "var(--success-text)";
+        const bg = pct === null || pct > 50 ? "var(--warning-bg)" : "var(--success-bg)";
+        const pctText = pct !== null ? ` — ${pct}% de tu disponible` : "";
+        preview.innerHTML = `<div class="card" style="background:${bg}; margin-top:4px;">
+          <p style="font-size:12px; color:${color}; margin:0;">
+            ${pct !== null && pct <= 50 ? "✓ Alcanzable." : "⚠ Puede ser difícil."} Necesitas ${money(sugerido)}/mes${pctText}.
+          </p></div>`;
+      }
+    } else {
+      preview.innerHTML = "";
+    }
+  }
+
+  ["ngAmount", "ngMonths", "ngMonthly"].forEach(id => {
+    document.getElementById(id).addEventListener("input", updatePreview);
+  });
+
   document.getElementById("cancelNewGoal").addEventListener("click", () => { modal.classList.remove("visible"); modal.innerHTML = ""; });
   document.getElementById("saveNewGoal").addEventListener("click", async () => {
     const name = document.getElementById("ngName").value.trim();
     const amount = Number(document.getElementById("ngAmount").value);
     const months = Number(document.getElementById("ngMonths").value);
+    const monthly = Number(document.getElementById("ngMonthly").value);
     const priority = document.getElementById("ngPriority").value;
     const errEl = document.getElementById("ngErr");
-    if (!name || amount <= 0 || months <= 0) {
-      errEl.textContent = "Completá todos los campos (mayores a cero).";
-      errEl.classList.add("visible");
-      return;
+
+    // Necesita al menos el monto y uno de los dos (plazo o aporte)
+    if (!name || amount <= 0) {
+      errEl.textContent = "Completa el nombre y el monto objetivo.";
+      errEl.classList.add("visible"); return;
     }
+    if (months <= 0 && monthly <= 0) {
+      errEl.textContent = "Pon el plazo en meses o cuánto puedes dar por mes.";
+      errEl.classList.add("visible"); return;
+    }
+
+    // Si solo puso aporte, calcula el plazo
+    const targetMonths = months > 0 ? months : Math.ceil(amount / monthly);
+
     const yaExiste = state.goals.some(g => g.name.trim().toLowerCase() === name.toLowerCase());
     if (yaExiste && !confirm(`Ya tienes una meta llamada "${name}". ¿Quieres crear otra igual?`)) return;
     const saveBtn = document.getElementById("saveNewGoal");
     saveBtn.disabled = true;
     saveBtn.textContent = "Guardando…";
     const { error } = await supabase.from("goals").insert({
-      user_id: user.id, name, target_amount: amount, target_months: months,
+      user_id: user.id, name, target_amount: amount, target_months: targetMonths,
       linked_account_id: state.account.id, priority,
     });
     if (error) {
-      errEl.textContent = "No se pudo guardar. Intentá de nuevo.";
+      errEl.textContent = "No se pudo guardar. Intenta de nuevo.";
       errEl.classList.add("visible");
-      saveBtn.disabled = false;
-      saveBtn.textContent = "Crear meta";
+      saveBtn.disabled = false; saveBtn.textContent = "Crear meta";
       return;
     }
     modal.classList.remove("visible"); modal.innerHTML = "";
