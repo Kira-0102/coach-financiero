@@ -306,7 +306,7 @@ function renderOnboardingAccount() {
   root.innerHTML = `
     <div class="screen">
       <p class="step-label">Paso 1 de 4</p>
-      <h1>Antes de empezar, ¿cómo te llamás?</h1>
+      <h1>Antes de empezar, ¿cómo te llamas?</h1>
       <div class="error-banner" id="err"></div>
 
       <label>Tu nombre</label>
@@ -323,7 +323,7 @@ function renderOnboardingAccount() {
         <div class="type-option ${existing?.type === "savings" ? "selected" : ""}" data-type="savings">Ahorro</div>
       </div>
 
-      <label>¿Cuánto tenés ahí ahora mismo?</label>
+      <label>¿Cuánto tienes ahí ahora mismo?</label>
       <input id="accBalance" type="number" step="1" min="0" placeholder="RD$0" style="margin-bottom:20px;" value="${existing ? existing.current_balance : ""}" />
 
       <button class="btn-primary" id="continueBtn" style="width:100%;">Continuar</button>
@@ -382,7 +382,7 @@ function renderOnboardingIncome() {
     root.innerHTML = `
       <div class="screen">
         <p class="step-label">Paso 2 de 4</p>
-        <h1>¿Con qué frecuencia cobrás?</h1>
+        <h1>¿Con qué frecuencia cobras?</h1>
         <p class="subtitle">Primero esto, para saber qué monto pedirte después.</p>
 
         <div class="type-grid" style="grid-template-columns:1fr 1fr;" id="freqGrid">
@@ -390,7 +390,7 @@ function renderOnboardingIncome() {
           <div class="type-option ${frequency === "biweekly" ? "selected" : ""}" data-f="biweekly">Quincenal</div>
         </div>
 
-        <label style="text-align:center;">${frequency === "biweekly" ? "¿Cuánto ganás cada quincena?" : "¿Cuánto ganás al mes?"}</label>
+        <label style="text-align:center;">${frequency === "biweekly" ? "¿Cuánto ganas cada quincena?" : "¿Cuánto ganas al mes?"}</label>
         <input id="incAmount" type="number" step="1" min="0" placeholder="RD$0" style="text-align:center; font-size:18px; margin-bottom:4px;" value="${state.profile?.declared_monthly_income ?? ""}" />
         <p class="hint" id="incHint" style="text-align:center;">Antes de descontar tus gastos fijos.</p>
 
@@ -460,14 +460,14 @@ function renderOnboardingFixed() {
       <div class="screen">
         <p class="step-label">Paso 3 de 4</p>
         <h1>Sumá tus gastos fijos</h1>
-        <p class="subtitle">Los que se repiten cada mes. Podés agregar más después.</p>
+        <p class="subtitle">Los que se repiten cada mes. Puedes agregar más después.</p>
 
         <div id="fixedList" style="max-height:140px; overflow-y:auto; margin-bottom:10px;">${rows}</div>
 
         <div class="error-banner" id="err"></div>
 
         <input id="fName" placeholder="Ej. Casa" style="margin-bottom:2px;" />
-        <p class="hint">Uno por vez — escribí el nombre, tocá "+ Agregar", y repetí para el siguiente.</p>
+        <p class="hint">Uno por vez — escribe el nombre, toca "+ Agregar", y repite para el siguiente.</p>
         <label>Categoría</label>
         <select id="fCat" style="margin-bottom:8px;">
           <option value="" selected>Elegí una categoría</option>
@@ -554,7 +554,7 @@ function renderOnboardingGoal() {
       ${sospechosamenteBajo ? `
         <div class="card warning" style="margin-top:8px;">
           <p style="font-size:12px; margin:0; color:var(--warning-text);">
-            ⚠ ${money(target)} es menos que un mes de tus gastos fijos (${money(totalFixed())}). Si es tu fondo de emergencia, revisá que no te haya faltado un cero.
+            ⚠ ${money(target)} es menos que un mes de tus gastos fijos (${money(totalFixed())}). Si es tu fondo de emergencia, revisa que no te haya faltado un cero.
           </p>
         </div>
       ` : ""}
@@ -669,7 +669,7 @@ function backLink() {
 
 function tplMas() {
   const items = [
-    { tab: "ingreso", icon: "💰", label: "Perfil e ingreso", desc: "Tu nombre y cuánto ganás" },
+    { tab: "ingreso", icon: "💰", label: "Perfil e ingreso", desc: "Tu nombre y cuánto ganas" },
     { tab: "gastos", icon: "🧾", label: "Gastos", desc: "Ver, editar y borrar tus movimientos" },
     { tab: "metas", icon: "🎯", label: "Metas", desc: "Tus objetivos de ahorro" },
     { tab: "fijos", icon: "💳", label: "Gastos fijos", desc: "Lo que se repite cada mes" },
@@ -869,7 +869,7 @@ function wireSimulador() {
       warnEl.style.borderRadius = "10px";
       warnEl.style.padding = "10px 12px";
       warnEl.style.marginTop = "8px";
-      warnEl.innerHTML = `<span>⚠️</span><p style="font-size:12px; color:var(--danger-text); margin:0; line-height:1.5;">Aunque tu plan mensual lo permite, hoy no tenés ${money(val)} en tu cuenta real (tenés ${money(balance())}). No podrías hacer esta compra en este momento.</p>`;
+      warnEl.innerHTML = `<span>⚠️</span><p style="font-size:12px; color:var(--danger-text); margin:0; line-height:1.5;">Aunque tu plan mensual lo permite, hoy no tienes ${money(val)} en tu cuenta real (tienes ${money(balance())}). No puedes hacer esta compra en este momento.</p>`;
     } else {
       warnEl.style.display = "none";
     }
@@ -887,7 +887,7 @@ function wireSimulador() {
     let msg = `Estoy pensando en gastar ${money(amount)} ${thing}. Ya gasté ${money(alreadySpent)} este mes, así que con esto me quedarían ${money(disponible() - alreadySpent - amount)} de disponible.`;
     if (state.goals.length === 1) msg += ` ¿Cómo afecta esto a mi meta "${state.goals[0].name}"?`;
     else if (state.goals.length > 1) msg += ` ¿Cómo afecta esto a mis metas (${state.goals.map(gl => gl.name).join(", ")})?`;
-    msg += " ¿Qué opinás?";
+    msg += " ¿Qué opinas?";
     tab = "coach";
     renderApp();
     const input = document.getElementById("coachInput");
@@ -957,7 +957,7 @@ function tplInicio() {
       <div class="card" style="background:var(--success-bg); text-align:center; padding:16px;">
         <p style="font-size:22px; margin:0 0 4px;">🎉</p>
         <p style="font-size:13px; font-weight:600; color:var(--success-text); margin:0 0 4px;">¡Cumpliste todas tus metas!</p>
-        <p style="font-size:11px; color:var(--success-text); margin:0;">Creá una nueva desde Más → Metas.</p>
+        <p style="font-size:11px; color:var(--success-text); margin:0;">Crea una nueva desde Más → Metas.</p>
       </div>
     ` : ""}
 
@@ -965,8 +965,8 @@ function tplInicio() {
       <span>ℹ️</span>
       <p style="font-size:12px; color:var(--teal); margin:0; line-height:1.5;">
         ${state.profile.pay_frequency === "monthly"
-          ? "Cobrás a fin de mes, así que no esperes ver aportes hasta entonces."
-          : "Cobrás quincenal, tu primer aporte puede llegar antes de fin de mes."}
+          ? "Cobras a fin de mes, así que no esperes ver aportes hasta entonces."
+          : "Cobras quincenal, tu primer aporte puede llegar antes de fin de mes."}
       </p>
     </div>
 
@@ -981,18 +981,18 @@ function tplIngreso() {
   const freq = state.profile.pay_frequency || "monthly";
   return `
     <h1 style="text-align:left; margin-bottom:4px;">Tu perfil</h1>
-    <p style="font-size:11px; color:var(--text-muted); margin:0 0 16px;">Tu nombre y cuánto ganás. Esto afecta todos los cálculos de la app.</p>
+    <p style="font-size:11px; color:var(--text-muted); margin:0 0 16px;">Tu nombre y cuánto ganas. Esto afecta todos los cálculos de la app.</p>
 
     <label>Tu nombre</label>
     <input id="ingName" value="${state.profile?.display_name ? esc(state.profile.display_name) : ""}" placeholder="Ej. Luis" style="margin-bottom:14px;" />
 
-    <label>¿Con qué frecuencia cobrás?</label>
+    <label>¿Con qué frecuencia cobras?</label>
     <div class="type-grid" style="grid-template-columns:1fr 1fr; margin-bottom:14px;" id="ingFreqGrid">
       <div class="type-option ${freq === "monthly" ? "selected" : ""}" data-f="monthly">Fin de mes</div>
       <div class="type-option ${freq === "biweekly" ? "selected" : ""}" data-f="biweekly">Quincenal</div>
     </div>
 
-    <label id="ingAmountLabel">${freq === "biweekly" ? "¿Cuánto ganás cada quincena?" : "¿Cuánto ganás al mes?"}</label>
+    <label id="ingAmountLabel">${freq === "biweekly" ? "¿Cuánto ganas cada quincena?" : "¿Cuánto ganas al mes?"}</label>
     <input id="ingAmount" type="number" step="1" min="0" value="${state.profile.declared_monthly_income ?? ""}" style="margin-bottom:16px;" />
 
     <div class="error-banner" id="ingErr"></div>
@@ -1011,7 +1011,7 @@ function wireIngreso() {
       grid.querySelectorAll(".type-option").forEach(o => o.classList.remove("selected"));
       el.classList.add("selected");
       document.getElementById("ingAmountLabel").textContent =
-        selectedFreq === "biweekly" ? "¿Cuánto ganás cada quincena?" : "¿Cuánto ganás al mes?";
+        selectedFreq === "biweekly" ? "¿Cuánto ganas cada quincena?" : "¿Cuánto ganas al mes?";
     });
   });
 
@@ -1183,7 +1183,7 @@ function fixedAddForm() {
 
 function tplDeudas() {
   if (state.debts.length === 0) {
-    return `<div class="empty-state"><div class="icon-circle">📄</div><p style="font-size:13px; color:var(--text-muted);">No tenés deudas registradas.</p></div>
+    return `<div class="empty-state"><div class="icon-circle">📄</div><p style="font-size:13px; color:var(--text-muted);">No tienes deudas registradas.</p></div>
       ${debtAddForm()}`;
   }
   return `
@@ -1236,7 +1236,7 @@ function debtAddForm() {
       <input id="newDAmount" type="number" step="1" min="0" placeholder="Monto total de la deuda" style="margin-bottom:8px;" />
       <label>Tasa de interés anual <span style="color:var(--text-muted);">(opcional, en %)</span></label>
       <input id="newDInterest" type="number" step="1" min="0" placeholder="Ej. 45" style="margin-bottom:8px;" />
-      <label>¿En cuántas cuotas planeás pagarla? <span style="color:var(--text-muted);">(opcional)</span></label>
+      <label>¿En cuántas cuotas planeas pagarla? <span style="color:var(--text-muted);">(opcional)</span></label>
       <input id="newDInstallments" type="number" step="1" min="0" placeholder="Ej. 10" style="margin-bottom:8px;" />
       <button class="btn-secondary" id="addDebtBtn" style="width:100%;">+ Agregar deuda</button>
     </div>
@@ -1246,7 +1246,7 @@ function debtAddForm() {
 function tplPresupuestos() {
   return `
     <h1 style="text-align:left; margin-bottom:4px;">Tus presupuestos</h1>
-    <p style="font-size:11px; color:var(--text-muted); margin:0 0 14px;">Cuánto planeás gastar por categoría este mes.</p>
+    <p style="font-size:11px; color:var(--text-muted); margin:0 0 14px;">Cuánto planeas gastar por categoría este mes.</p>
     ${categories.map(c => {
       const budget = state.budgets.find(b => b.category_id === c.id);
       const spent = spentThisMonthByCategory(c.id);
@@ -1619,7 +1619,7 @@ function openPayDebtModal(debtId) {
       return;
     }
     if (amount > Number(d.current_balance)) {
-      errEl.textContent = `Estás pagando más de lo que debés (${money(d.current_balance)}). Corregí el monto.`;
+      errEl.textContent = `Estás pagando más de lo que debes (${money(d.current_balance)}). Corrige el monto.`;
       errEl.classList.add("visible");
       return;
     }
@@ -1668,8 +1668,8 @@ function openGoalCelebrationModal(goalName, monthsEarly, monthlyFreed, nextGoal)
   const freedMsg = monthlyFreed > 0
     ? `<div class="card" style="background:var(--teal-light); margin:14px 0;">
          <p style="font-size:12px; color:var(--teal); margin:0; line-height:1.6;">
-           Ahora tenés <strong>${money(monthlyFreed)}/mes</strong> que antes iban a esta meta.
-           ${nextGoal ? `¿Los destinás a tu meta "${esc(nextGoal.name)}"?` : "Podés crear una nueva meta o dejarlo en tu disponible."}
+           Ahora tienes <strong>${money(monthlyFreed)}/mes</strong> que antes iban a esta meta.
+           ${nextGoal ? `¿Los destinas a tu meta "${esc(nextGoal.name)}"?` : "Puedes crear una nueva meta o dejarlo en tu disponible."}
          </p>
        </div>`
     : "";
@@ -1765,7 +1765,7 @@ function openNewGoalModal() {
       return;
     }
     const yaExiste = state.goals.some(g => g.name.trim().toLowerCase() === name.toLowerCase());
-    if (yaExiste && !confirm(`Ya tenés una meta llamada "${name}". ¿Querés crear otra igual?`)) return;
+    if (yaExiste && !confirm(`Ya tienes una meta llamada "${name}". ¿Quieres crear otra igual?`)) return;
     const saveBtn = document.getElementById("saveNewGoal");
     saveBtn.disabled = true;
     saveBtn.textContent = "Guardando…";
@@ -1802,7 +1802,7 @@ function openContributeModal(goalId) {
       <p class="step-label">Aportar a "${esc(g.name)}"</p>
       <p style="font-size:12px; color:var(--text-muted); text-align:center; margin:0 0 4px;">Te falta ${money(restante)} para tu objetivo.</p>
       <p style="font-size:11px; color:var(--text-muted); text-align:center; margin:0 0 14px;">Saldo disponible ahora: ${money(balance())}</p>
-      <label>¿Cuánto querés apartar?</label>
+      <label>¿Cuánto quieres apartar?</label>
       <input id="contribAmount" type="number" min="0" step="1" value="${sugerido > 0 ? sugerido : ""}" style="margin-bottom:16px;" />
       <div class="error-banner" id="contribErr"></div>
       <div class="btn-row">

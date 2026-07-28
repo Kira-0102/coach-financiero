@@ -9,7 +9,7 @@
 <body>
 
 <div class="screen">
-  <h1 id="formTitle">Iniciá sesión</h1>
+  <h1 id="formTitle">Inicia sesión</h1>
   <p class="subtitle">Tu coach financiero, con tus datos reales.</p>
 
   <div class="error-banner" id="errorBanner"></div>
@@ -25,8 +25,11 @@
   </button>
 
   <p style="text-align:center; font-size:13px; color:var(--text-secondary);">
-    <span id="toggleText">¿No tenés cuenta?</span>
-    <button class="link-btn" id="toggleModeBtn">Registrate</button>
+    <span id="toggleText">¿No tienes cuenta?</span>
+    <button class="link-btn" id="toggleModeBtn">Regístrate</button>
+  </p>
+  <p style="text-align:center; margin-top:8px;" id="forgotWrap">
+    <button class="link-btn" id="forgotBtn" style="font-size:12px;">¿Olvidaste tu contraseña?</button>
   </p>
 </div>
 
@@ -41,22 +44,46 @@
   const submitBtn = document.getElementById("submitBtn");
   const errorBanner = document.getElementById("errorBanner");
 
-  function showError(msg) {
+  function showError(msg, isSuccess = false) {
     errorBanner.textContent = msg;
+    errorBanner.style.background = isSuccess ? "var(--success-bg)" : "";
+    errorBanner.style.color = isSuccess ? "var(--success-text)" : "";
     errorBanner.classList.add("visible");
   }
   function clearError() {
     errorBanner.classList.remove("visible");
+    errorBanner.style.background = "";
+    errorBanner.style.color = "";
   }
 
   toggleModeBtn.addEventListener("click", () => {
     mode = mode === "login" ? "signup" : "login";
-    formTitle.textContent = mode === "login" ? "Iniciá sesión" : "Creá tu cuenta";
+    formTitle.textContent = mode === "login" ? "Inicia sesión" : "Crea tu cuenta";
     submitBtn.textContent = mode === "login" ? "Entrar" : "Registrarme";
-    toggleText.textContent = mode === "login" ? "¿No tenés cuenta?" : "¿Ya tenés cuenta?";
-    toggleModeBtn.textContent = mode === "login" ? "Registrate" : "Iniciá sesión";
+    toggleText.textContent = mode === "login" ? "¿No tienes cuenta?" : "¿Ya tienes cuenta?";
+    toggleModeBtn.textContent = mode === "login" ? "Regístrate" : "Inicia sesión";
     document.getElementById("password").setAttribute("autocomplete", mode === "signup" ? "new-password" : "current-password");
+    document.getElementById("forgotWrap").style.display = mode === "login" ? "block" : "none";
     clearError();
+  });
+
+  document.getElementById("forgotBtn").addEventListener("click", async () => {
+    const email = document.getElementById("email").value.trim();
+    if (!email) {
+      showError("Escribí tu email arriba primero, y volvé a tocar este link.");
+      return;
+    }
+    const forgotBtn = document.getElementById("forgotBtn");
+    forgotBtn.disabled = true;
+    const { error } = await supabase.auth.resetPasswordForEmail(email, {
+      redirectTo: window.location.origin + "/reset-password.html",
+    });
+    forgotBtn.disabled = false;
+    if (error) {
+      showError("No se pudo enviar el correo. Intentá de nuevo.");
+      return;
+    }
+    showError("Si ese email tiene una cuenta, te mandamos un link para restablecer tu contraseña. Revisá tu correo.", true);
   });
 
   submitBtn.addEventListener("click", handleSubmit);
@@ -107,8 +134,12 @@
   }
 
   function traducirError(msg) {
-    if (msg.includes("Invalid login credentials")) return "Email o contraseña incorrectos.";
-    if (msg.includes("User already registered")) return "Ese email ya tiene una cuenta. Iniciá sesión.";
+    if (msg.includes("Invalid login credentials")) {
+      return mode === "login"
+        ? "Email o contraseña incorrectos. Si es tu primera vez acá, toca \"Regístrate\" abajo."
+        : "Email o contraseña incorrectos.";
+    }
+    if (msg.includes("User already registered")) return "Ese email ya tiene una cuenta. Inicia sesión.";
     if (msg.includes("Email not confirmed")) return "Confirmá tu correo antes de entrar — revisá tu bandeja de entrada.";
     return "No se pudo completar la acción. Intentá de nuevo.";
   }
