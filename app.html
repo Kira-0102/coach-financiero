@@ -184,6 +184,12 @@ function goalMonthlyPace(g) {
 
 // Suma el ritmo mensual necesario de TODAS las metas activas — porque
 // todas compiten por el mismo disponible, no alcanza con mirar una sola.
+function goalPriorityLabel(priority) {
+  if (priority === "critical") return "🔴 Alta";
+  if (priority === "important") return "🟡 Media";
+  return "🔵 Baja";
+}
+
 function goalMonthsLeft(g) {
   if (!g || !g.target_months) return 0;
   const created = new Date(g.created_at);
@@ -192,8 +198,21 @@ function goalMonthsLeft(g) {
   return Math.max(0, g.target_months - elapsed);
 }
 
+// Calcula cuántos meses antes del plazo se completó la meta.
+// Si es positivo, se logró antes de tiempo. Si es 0 o negativo, a tiempo o tarde.
+function goalMonthsEarly(g) {
+  if (!g || !g.completed_at || !g.created_at || !g.target_months) return 0;
+  const created = new Date(g.created_at);
+  const completed = new Date(g.completed_at);
+  const monthsUsed = (completed.getFullYear() - created.getFullYear()) * 12 + (completed.getMonth() - created.getMonth());
+  return Math.max(0, g.target_months - monthsUsed);
+}
+
 function totalGoalMonthlyPace() {
-  return state.goals.reduce((sum, g) => sum + goalMonthlyPace(g), 0);
+  // Solo metas activas — las completadas ya no necesitan aportes.
+  return state.goals
+    .filter(g => g.status !== "completed")
+    .reduce((sum, g) => sum + goalMonthlyPace(g), 0);
 }
 
 // P6: deriva el estado visible de una meta. 'completed' si ya llegó;
@@ -883,7 +902,9 @@ function wireSimulador() {
 
 function primaryGoal() {
   const order = { critical: 0, important: 1, optional: 2 };
-  return [...state.goals].sort((a, b) => (order[a.priority] ?? 3) - (order[b.priority] ?? 3))[0];
+  // Solo metas activas o en riesgo — las completadas no van al Dashboard
+  const activas = state.goals.filter(g => g.status !== "completed");
+  return [...activas].sort((a, b) => (order[a.priority] ?? 3) - (order[b.priority] ?? 3))[0];
 }
 
 function tplInicio() {
@@ -924,14 +945,20 @@ function tplInicio() {
         <div class="row-between" style="margin-bottom:6px;">
           <span style="font-weight:500;">${esc(g.name)}</span>
           <span style="display:flex; align-items:center; gap:6px;">
-            <span class="badge ${g.priority}">${g.priority === "critical" ? "Crítica" : g.priority === "important" ? "Importante" : "Opcional"}</span>
+            <span class="badge ${g.priority}">${goalPriorityLabel(g.priority)}</span>
             <span style="color:var(--text-muted);">›</span>
           </span>
         </div>
         <p style="font-size:11px; color:var(--text-muted); margin:0 0 6px;">${money(g.current_amount)} de ${money(g.target_amount)} · ${goalMonthsLeft(g) > 0 ? "Faltan " + goalMonthsLeft(g) + " meses" : "Plazo cumplido"}</p>
         <div class="progress-bar"><div class="progress-fill" style="width:${progressPct}%;"></div></div>
       </div>
-      ${state.goals.length > 1 ? `<p style="font-size:11px; color:var(--text-muted); margin:-4px 0 10px; text-align:center;">+${state.goals.length - 1} meta${state.goals.length > 2 ? "s" : ""} más</p>` : ""}
+      ${state.goals.filter(x => x.status !== "completed").length > 1 ? `<p style="font-size:11px; color:var(--text-muted); margin:-4px 0 10px; text-align:center;">+${state.goals.filter(x => x.status !== "completed").length - 1} meta${state.goals.filter(x => x.status !== "completed").length > 2 ? "s" : ""} más</p>` : ""}
+    ` : state.goals.length > 0 ? `
+      <div class="card" style="background:var(--success-bg); text-align:center; padding:16px;">
+        <p style="font-size:22px; margin:0 0 4px;">🎉</p>
+        <p style="font-size:13px; font-weight:600; color:var(--success-text); margin:0 0 4px;">¡Cumpliste todas tus metas!</p>
+        <p style="font-size:11px; color:var(--success-text); margin:0;">Creá una nueva desde Más → Metas.</p>
+      </div>
     ` : ""}
 
     <div class="card accent" style="display:flex; gap:8px;">
@@ -1054,28 +1081,36 @@ function tplGastos() {
 }
 
 function tplMetas() {
-  const list = state.goals.map(g => {
+  const activas = state.goals.filter(g => g.status !== "completed");
+  const completadas = state.goals.filter(g => g.status === "completed");
+
+  function cardMeta(g, esCompletada = false) {
     const progressPct = Math.min(100, Math.round((Number(g.current_amount) / Number(g.target_amount)) * 100));
     const monthly = goalMonthlyPace(g);
-    const priorityLabel = g.priority === "critical" ? "Crítica" : g.priority === "important" ? "Importante" : "Opcional";
+    const priorityLabel = goalPriorityLabel(g.priority);
     const st = goalStatus(g);
     const stLabel = goalStatusLabel(st);
-    const done = st === "completed";
     return `
-      <div class="card">
+      <div class="card" style="${esCompletada ? 'opacity:0.75;' : ''}">
         <div class="row-between" style="margin-bottom:6px;">
           <span style="font-weight:500;">${esc(g.name)}</span>
           <div style="display:flex; gap:6px; align-items:center;">
-            <span class="badge ${g.priority}">${priorityLabel}</span>
+            ${!esCompletada ? `<span class="badge ${g.priority}">${priorityLabel}</span>` : ""}
             <button data-edit-goal="${g.id}" style="background:none; color:var(--text-muted); font-size:12px;">✎</button>
             <button data-del-goal="${g.id}" style="background:none; color:var(--text-muted); font-size:12px;">✕</button>
           </div>
         </div>
         <div style="display:inline-block; font-size:10px; border-radius:10px; padding:2px 8px; margin-bottom:8px; background:${stLabel.bg}; color:${stLabel.color};">${stLabel.text}</div>
-        <p style="font-size:11px; color:var(--text-muted); margin:0 0 6px;">${money(g.current_amount)} de ${money(g.target_amount)} · ${goalMonthsLeft(g) > 0 ? "Faltan " + goalMonthsLeft(g) + " meses" : "Plazo cumplido"}</p>
-        <div class="progress-bar"><div class="progress-fill" style="width:${progressPct}%; background:${done ? 'var(--success-text)' : 'var(--gold)'};"></div></div>
-        ${done
-          ? `<p style="font-size:11px; color:var(--success-text); margin:8px 0 0;">Llegaste a tu objetivo 🎉</p>`
+        <p style="font-size:11px; color:var(--text-muted); margin:0 0 6px;">${money(g.current_amount)} de ${money(g.target_amount)}${!esCompletada && goalMonthsLeft(g) > 0 ? " · Faltan " + goalMonthsLeft(g) + " meses" : ""}</p>
+        <div class="progress-bar"><div class="progress-fill" style="width:${progressPct}%; background:${esCompletada ? 'var(--success-text)' : 'var(--gold)'};"></div></div>
+        ${esCompletada
+          ? `<div style="margin-top:8px;">
+               <p style="font-size:11px; color:var(--success-text); margin:0 0 4px;">Meta cumplida 🎉</p>
+               ${goalMonthsEarly(g) > 0
+                 ? `<span style="font-size:10px; background:var(--success-bg); color:var(--success-text); border-radius:10px; padding:2px 8px;">🚀 ${goalMonthsEarly(g)} mes${goalMonthsEarly(g) > 1 ? "es" : ""} antes de lo previsto</span>`
+                 : ""
+               }
+             </div>`
           : `<div class="row-between" style="margin-top:10px;">
                <span style="font-size:11px; color:var(--text-muted);">Aporte mensual: ${money(monthly)}</span>
                <button data-contribute="${g.id}" class="btn-secondary" style="padding:6px 12px; font-size:12px;">+ Aportar</button>
@@ -1083,14 +1118,23 @@ function tplMetas() {
         }
       </div>
     `;
-  }).join("");
+  }
 
   return `
     <h1 style="text-align:left; margin-bottom:14px;">Tus metas</h1>
-    ${state.goals.length === 0
+    ${activas.length === 0 && completadas.length === 0
       ? `<div class="empty-state"><div class="icon-circle">🎯</div><p style="font-size:13px; color:var(--text-muted);">Todavía no creaste ninguna meta.</p></div>`
-      : list
+      : activas.length === 0
+        ? `<div class="card" style="background:var(--success-bg); text-align:center; padding:16px; margin-bottom:14px;">
+             <p style="font-size:22px; margin:0 0 4px;">🎉</p>
+             <p style="font-size:13px; font-weight:600; color:var(--success-text); margin:0;">¡Cumpliste todas tus metas activas!</p>
+           </div>`
+        : activas.map(g => cardMeta(g, false)).join("")
     }
+    ${completadas.length > 0 ? `
+      <p style="font-size:11px; font-weight:600; color:var(--text-muted); margin:16px 0 8px; text-transform:uppercase; letter-spacing:0.5px;">Completadas</p>
+      ${completadas.map(g => cardMeta(g, true)).join("")}
+    ` : ""}
     <button class="btn-secondary" id="openNewGoalBtn" style="width:100%; margin-top:14px;">+ Nueva meta</button>
   `;
 }
@@ -1613,6 +1657,73 @@ function openPayDebtModal(debtId) {
 }
 
 // ---------------------------------------------------------------
+// MODAL: CELEBRACIÓN AL COMPLETAR UNA META
+// ---------------------------------------------------------------
+function openGoalCelebrationModal(goalName, monthsEarly, monthlyFreed, nextGoal) {
+  const modal = document.getElementById("logModal");
+  modal.classList.add("visible");
+  const earlyMsg = monthsEarly > 0
+    ? `<p style="font-size:13px; color:var(--success-text); margin:0 0 6px;">🚀 ¡${monthsEarly} mes${monthsEarly > 1 ? "es" : ""} antes de lo previsto!</p>`
+    : "";
+  const freedMsg = monthlyFreed > 0
+    ? `<div class="card" style="background:var(--teal-light); margin:14px 0;">
+         <p style="font-size:12px; color:var(--teal); margin:0; line-height:1.6;">
+           Ahora tenés <strong>${money(monthlyFreed)}/mes</strong> que antes iban a esta meta.
+           ${nextGoal ? `¿Los destinás a tu meta "${esc(nextGoal.name)}"?` : "Podés crear una nueva meta o dejarlo en tu disponible."}
+         </p>
+       </div>`
+    : "";
+  modal.innerHTML = `
+    <div class="modal-box" style="text-align:center;">
+      <p style="font-size:40px; margin:0 0 8px;">🎉</p>
+      <p style="font-size:17px; font-weight:600; color:var(--teal); margin:0 0 6px;">¡Meta cumplida!</p>
+      <p style="font-size:13px; color:var(--text-secondary); margin:0 0 4px;">${esc(goalName)}</p>
+      ${earlyMsg}
+      ${freedMsg}
+      <div class="btn-row" style="margin-top:16px;">
+        ${nextGoal
+          ? `<button class="btn-secondary" id="celebClose">Cerrar</button>
+             <button class="btn-primary" id="celebSimulate">Ver en simulador</button>`
+          : `<button class="btn-secondary" id="celebClose">Cerrar</button>
+             <button class="btn-primary" id="celebNewGoal">+ Nueva meta</button>`
+        }
+      </div>
+    </div>
+  `;
+
+  const close = () => { modal.classList.remove("visible"); modal.innerHTML = ""; renderApp(); };
+
+  document.getElementById("celebClose").addEventListener("click", close);
+
+  const celebSimulate = document.getElementById("celebSimulate");
+  if (celebSimulate) celebSimulate.addEventListener("click", () => {
+    modal.classList.remove("visible"); modal.innerHTML = "";
+    tab = "simular";
+    renderApp();
+    // Precarga el simulador con el monto que se libera mensualmente
+    setTimeout(() => {
+      const amountInput = document.getElementById("simAmountInput");
+      const slider = document.getElementById("simSlider");
+      if (amountInput && monthlyFreed > 0) {
+        amountInput.value = monthlyFreed;
+        slider.value = Math.min(monthlyFreed, Number(slider.max));
+        amountInput.dispatchEvent(new Event("input"));
+      }
+    }, 100);
+  });
+
+  const celebNewGoal = document.getElementById("celebNewGoal");
+  if (celebNewGoal) celebNewGoal.addEventListener("click", () => {
+    modal.classList.remove("visible"); modal.innerHTML = "";
+    tab = "metas";
+    renderApp();
+    setTimeout(() => {
+      document.getElementById("openNewGoalBtn")?.click();
+    }, 100);
+  });
+}
+
+// ---------------------------------------------------------------
 // MODAL: NUEVA META (con selector de prioridad)
 // ---------------------------------------------------------------
 function openNewGoalModal() {
@@ -1628,11 +1739,12 @@ function openNewGoalModal() {
       <label>¿En cuántos meses?</label>
       <input id="ngMonths" type="number" step="1" min="0" placeholder="Ej. 6" style="margin-bottom:10px;" />
       <label>Prioridad</label>
-      <select id="ngPriority" style="margin-bottom:16px;">
-        <option value="critical">Crítica</option>
-        <option value="important" selected>Importante</option>
-        <option value="optional">Opcional</option>
+      <select id="ngPriority" style="margin-bottom:4px;">
+        <option value="critical">🔴 Alta</option>
+        <option value="important" selected>🟡 Media</option>
+        <option value="optional">🔵 Baja</option>
       </select>
+      <p class="hint" style="margin-top:-6px; margin-bottom:10px;">Las de prioridad Alta se muestran primero en tu Dashboard y en las sugerencias del coach.</p>
       <div class="error-banner" id="ngErr"></div>
       <div class="btn-row">
         <button class="btn-secondary" id="cancelNewGoal">Cancelar</button>
@@ -1736,14 +1848,27 @@ function openContributeModal(goalId) {
       goal_id: g.id, transaction_id: txData.id, amount, amount_after: newAmount,
     });
     // 3. Subir el progreso y marcar completada si llegó
+    const completedAt = completed ? new Date().toISOString() : null;
     await supabase.from("goals").update({
       current_amount: newAmount,
       status: completed ? "completed" : "active",
+      ...(completedAt ? { completed_at: completedAt } : {}),
     }).eq("id", g.id);
 
     modal.classList.remove("visible"); modal.innerHTML = "";
-    await loadState(); renderApp();
-    showToast(completed ? "¡Meta cumplida! 🎉" : "Aporte registrado");
+    await loadState();
+
+    if (completed) {
+      // Calcular cuántos meses antes y cuánto dinero se libera
+      const monthsEarly = goalMonthsLeft(g); // meses que quedaban cuando aportó
+      const updatedGoal = state.goals.find(x => x.id === g.id);
+      const monthlyPaceWas = goalMonthlyPace({ ...g, current_amount: 0 }); // aporte mensual que ya no se necesita
+      const nextActive = state.goals.find(x => x.status !== "completed" && x.id !== g.id);
+      openGoalCelebrationModal(g.name, monthsEarly, Math.round(monthlyPaceWas), nextActive);
+    } else {
+      renderApp();
+      showToast("Aporte registrado");
+    }
   });
 }
 
@@ -1764,11 +1889,12 @@ function openEditGoalModal(goalId) {
       <label>Plazo (meses)</label>
       <input id="egMonths" type="number" step="1" min="0" value="${g.target_months}" style="margin-bottom:10px;" />
       <label>Prioridad</label>
-      <select id="egPriority" style="margin-bottom:16px;">
-        <option value="critical" ${g.priority === "critical" ? "selected" : ""}>Crítica</option>
-        <option value="important" ${g.priority === "important" ? "selected" : ""}>Importante</option>
-        <option value="optional" ${g.priority === "optional" ? "selected" : ""}>Opcional</option>
+      <select id="egPriority" style="margin-bottom:4px;">
+        <option value="critical" ${g.priority === "critical" ? "selected" : ""}>🔴 Alta</option>
+        <option value="important" ${g.priority === "important" ? "selected" : ""}>🟡 Media</option>
+        <option value="optional" ${g.priority === "optional" ? "selected" : ""}>🔵 Baja</option>
       </select>
+      <p class="hint" style="margin-top:-6px; margin-bottom:10px;">Las de prioridad Alta se muestran primero en tu Dashboard y en las sugerencias del coach.</p>
       <div class="error-banner" id="egErr"></div>
       <div class="btn-row">
         <button class="btn-secondary" id="cancelEdit">Cancelar</button>
