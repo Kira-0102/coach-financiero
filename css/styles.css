@@ -256,22 +256,11 @@ button {
 .nav-item.active { color: var(--teal); }
 .nav-item .icon { font-size: 17px; }
 
-.list-item {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  background: var(--card);
-  border-radius: 10px;
-  padding: 10px 12px;
-  margin-bottom: 6px;
-  font-size: 13px;
-}
-
-.list-item .actions { display: flex; gap: 8px; }
-.list-item .actions button {
+.card .actions { display: flex; gap: 8px; }
+.card .actions button {
   background: none; color: var(--text-muted); font-size: 12px; padding: 2px;
 }
-.list-item .actions button:hover { color: var(--teal); }
+.card .actions button:hover { color: var(--teal); }
 
 .fab {
   width: 100%;

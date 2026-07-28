@@ -245,7 +245,7 @@ function disponible() {
 function balance() {
   if (!state.account) return 0;
   const accountTx = state.transactions.filter(t => t.account_id === state.account.id);
-  return Number(state.account.current_balance) + accountTx.reduce((s, t) => s + Number(t.amount), 0);
+  return Number(state.account.initial_balance) + accountTx.reduce((s, t) => s + Number(t.amount), 0);
 }
 
 function totalDebt() {
@@ -324,7 +324,7 @@ function renderOnboardingAccount() {
       </div>
 
       <label>¿Cuánto tienes ahí ahora mismo?</label>
-      <input id="accBalance" type="number" step="1" min="0" placeholder="RD$0" style="margin-bottom:20px;" value="${existing ? existing.current_balance : ""}" />
+      <input id="accBalance" type="number" step="1" min="0" placeholder="RD$0" style="margin-bottom:20px;" value="${existing ? existing.initial_balance : ""}" />
 
       <button class="btn-primary" id="continueBtn" style="width:100%;">Continuar</button>
     </div>
@@ -360,8 +360,8 @@ function renderOnboardingAccount() {
     // Si ya existe una cuenta (volviste desde un paso más adelante),
     // la actualizamos en vez de crear una segunda por accidente.
     const { error } = existing
-      ? await supabase.from("accounts").update({ name, type: selectedType, current_balance: balanceNum }).eq("id", existing.id)
-      : await supabase.from("accounts").insert({ user_id: user.id, name, type: selectedType, current_balance: balanceNum });
+      ? await supabase.from("accounts").update({ name, type: selectedType, initial_balance: balanceNum }).eq("id", existing.id)
+      : await supabase.from("accounts").insert({ user_id: user.id, name, type: selectedType, initial_balance: balanceNum });
     if (error) {
       errEl.textContent = "No se pudo guardar. Intentá de nuevo.";
       errEl.classList.add("visible");
@@ -450,7 +450,7 @@ function renderOnboardingIncome() {
 function renderOnboardingFixed() {
   function paint() {
     const rows = state.fixed.map(f => `
-      <div class="list-item">
+      <div class="card row-between" style="margin-bottom:6px; padding:10px 12px;">
         <span>${CATEGORY_ICONS[f.categories?.name] || "•"} ${esc(f.name)}</span>
         <span>${money(f.estimated_amount)}</span>
       </div>
@@ -664,7 +664,7 @@ function renderApp() {
 }
 
 function backLink() {
-  return `<button id="backToMas" style="background:none; color:var(--teal); font-size:13px; margin-bottom:14px; padding:8px 6px; margin-left:-6px;">‹ Más</button>`;
+  return `<button id="backToMas" class="btn-back" style="margin-bottom:14px;">‹ Más</button>`;
 }
 
 function tplMas() {
@@ -679,7 +679,7 @@ function tplMas() {
   return `
     <h1 style="text-align:left; margin-bottom:14px;">Más</h1>
     ${items.map(i => `
-      <button data-mas-item="${i.tab}" class="list-item" style="width:100%; text-align:left; cursor:pointer; padding:14px 12px;">
+      <button data-mas-item="${i.tab}" class="card row-between" style="width:100%; text-align:left; cursor:pointer; padding:14px 12px; margin-bottom:6px; border:none;">
         <span>${i.icon} <strong style="font-weight:500;">${i.label}</strong><br><span style="font-size:11px; color:var(--text-muted); margin-left:22px;">${i.desc}</span></span>
         <span style="color:var(--text-muted);">›</span>
       </button>
@@ -1062,7 +1062,7 @@ function tplGastos() {
         : (t.categories?.name || t.note || "Sin categoría");
       const icon = isIncome ? "💰" : (t.categories?.name ? (CATEGORY_ICONS[t.categories.name] || "•") : "📄");
       return `
-      <div class="list-item">
+      <div class="card row-between" style="margin-bottom:6px; padding:10px 12px;">
         <span>${icon} ${esc(label)}
           <span style="color:var(--text-muted); font-size:11px;"> · ${new Date(t.occurred_at).toLocaleDateString("es-DO", { day: "numeric", month: "short" })}</span>
         </span>
@@ -1148,7 +1148,7 @@ function tplFijos() {
     <h1 style="text-align:left; margin-bottom:4px;">Tus gastos fijos</h1>
     <p style="font-size:11px; color:var(--text-muted); margin:0 0 14px;">No son deudas — no tienen saldo pendiente.</p>
     ${state.fixed.map(f => `
-      <div class="list-item">
+      <div class="card row-between" style="margin-bottom:6px; padding:10px 12px;">
         <span>${CATEGORY_ICONS[f.categories?.name] || "•"} ${esc(f.name)}</span>
         <span style="display:flex; align-items:center; gap:10px;">
           ${money(f.estimated_amount)}
