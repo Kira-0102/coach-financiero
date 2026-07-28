@@ -1244,37 +1244,44 @@ function debtAddForm() {
 }
 
 function tplPresupuestos() {
+  const fijados = categories.filter(c => state.budgets.find(b => b.category_id === c.id));
+  const sinFijar = categories.filter(c => !state.budgets.find(b => b.category_id === c.id));
+
+  const rowFijados = fijados.map(c => {
+    const budget = state.budgets.find(b => b.category_id === c.id);
+    const spent = spentThisMonthByCategory(c.id);
+    const pct = Math.min(100, Math.round((spent / Number(budget.amount)) * 100));
+    const overBudget = pct >= 100;
+    return `
+      <div class="card" style="margin-bottom:8px;">
+        <div class="row-between" style="margin-bottom:6px;">
+          <span style="font-size:13px; font-weight:500;">${CATEGORY_ICONS[c.name] || "•"} ${c.name}</span>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <span style="font-size:11px; color:${overBudget ? 'var(--danger-text)' : 'var(--text-muted)'};">${money(spent)} / ${money(budget.amount)}</span>
+            <button data-edit-budget="${budget.id}" data-edit-cat="${c.id}" data-edit-amount="${budget.amount}"
+              style="background:none; color:var(--text-muted); font-size:12px;">✎</button>
+            <button data-remove-budget="${budget.id}"
+              style="background:none; color:var(--text-muted); font-size:12px;">✕</button>
+          </div>
+        </div>
+        <div class="progress-bar">
+          <div class="progress-fill" style="width:${pct}%; background:${overBudget ? 'var(--danger-text)' : 'var(--gold)'};"></div>
+        </div>
+      </div>
+    `;
+  }).join("");
+
   return `
     <h1 style="text-align:left; margin-bottom:4px;">Tus presupuestos</h1>
-    <p style="font-size:11px; color:var(--text-muted); margin:0 0 14px;">Cuánto planeas gastar por categoría este mes.</p>
-    ${categories.map(c => {
-      const budget = state.budgets.find(b => b.category_id === c.id);
-      const spent = spentThisMonthByCategory(c.id);
-      const pct = budget ? Math.min(100, Math.round((spent / Number(budget.amount)) * 100)) : 0;
-      return `
-        <div class="card">
-          <div class="row-between" style="margin-bottom:6px;">
-            <span>${CATEGORY_ICONS[c.name] || "•"} ${c.name}</span>
-            ${budget
-              ? `<button data-remove-budget="${budget.id}" style="background:none; color:var(--text-muted); font-size:12px;">✕</button>`
-              : ""}
-          </div>
-          ${budget ? `
-            <p style="font-size:11px; color:var(--text-muted); margin:0 0 6px;">${money(spent)} de ${money(budget.amount)} este mes</p>
-            <div class="progress-bar"><div class="progress-fill" style="width:${pct}%; background:${pct >= 100 ? 'var(--danger-text)' : 'var(--gold)'};"></div></div>
-            <div style="display:flex; gap:6px; margin-top:8px;">
-              <input type="number" step="1" min="0" placeholder="Nuevo monto" id="budgetEditInput-${c.id}" style="margin-bottom:0;" />
-              <button data-update-budget="${budget.id}" data-update-cat="${c.id}" class="btn-secondary" style="white-space:nowrap;">Actualizar</button>
-            </div>
-          ` : `
-            <div style="display:flex; gap:6px;">
-              <input type="number" step="1" min="0" placeholder="RD$0" id="budgetInput-${c.id}" style="margin-bottom:0;" />
-              <button data-set-budget="${c.id}" class="btn-secondary" style="white-space:nowrap;">Fijar</button>
-            </div>
-          `}
-        </div>
-      `;
-    }).join("")}
+    <p style="font-size:11px; color:var(--text-muted); margin:0 0 14px;">Límites de gasto por categoría este mes.</p>
+    ${fijados.length === 0
+      ? `<div class="empty-state"><div class="icon-circle">📊</div><p style="font-size:13px; color:var(--text-muted);">Todavía no fijaste ningún presupuesto.</p></div>`
+      : rowFijados
+    }
+    ${sinFijar.length > 0
+      ? `<button class="btn-secondary" id="openAddBudgetBtn" style="width:100%; margin-top:8px;">+ Agregar categoría</button>`
+      : `<p style="font-size:11px; color:var(--text-muted); text-align:center; margin-top:8px;">Todas las categorías ya tienen presupuesto.</p>`
+    }
   `;
 }
 
@@ -1393,6 +1400,57 @@ function wireTabEvents() {
       if (insertError) { alert("No se pudo actualizar. Intentá de nuevo."); return; }
       await loadState(); renderApp();
     });
+  });
+
+  // Agregar categoría — abre modal con selector
+  const openAddBudgetBtn = document.getElementById("openAddBudgetBtn");
+  if (openAddBudgetBtn) openAddBudgetBtn.addEventListener("click", () => openAddBudgetModal());
+
+  // Editar presupuesto — abre modal con monto actual precargado
+  document.querySelectorAll("[data-edit-budget]").forEach(btn => {
+    btn.addEventListener("click", () => openEditBudgetModal(
+      btn.dataset.editBudget,
+      btn.dataset.editCat,
+      Number(btn.dataset.editAmount)
+    ));
+  });
+
+  // Eliminar presupuesto
+  document.querySelectorAll("[data-remove-budget]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      if (!(await confirmAction("¿Quitar este presupuesto? Puedes fijar uno nuevo cuando quieras."))) return;
+      await supabase.from("budgets").update({ effective_to: new Date().toISOString().slice(0, 10) }).eq("id", btn.dataset.removeBudget);
+      await loadState(); renderApp();
+    });
+  });
+
+  const saveAllBudgetsBtn = document.getElementById("saveAllBudgetsBtn");
+  if (saveAllBudgetsBtn) saveAllBudgetsBtn.addEventListener("click", async () => {
+    const inputs = document.querySelectorAll(".budget-pending-input");
+    const toSave = [];
+    inputs.forEach(input => {
+      const amount = Number(input.value);
+      if (amount > 0) toSave.push({ catId: input.dataset.cat, amount });
+    });
+    if (toSave.length === 0) { alert("Escribe al menos un monto para guardar."); return; }
+    saveAllBudgetsBtn.disabled = true;
+    saveAllBudgetsBtn.textContent = "Guardando…";
+    const today = new Date().toISOString().slice(0, 10);
+    const inserts = toSave.map(({ catId, amount }) =>
+      supabase.from("budgets").insert({
+        user_id: user.id, category_id: catId, amount, effective_from: today,
+      })
+    );
+    const results = await Promise.all(inserts);
+    const failed = results.filter(r => r.error);
+    if (failed.length > 0) {
+      alert(`${failed.length} presupuesto(s) no se pudieron guardar. Intenta de nuevo.`);
+      saveAllBudgetsBtn.disabled = false;
+      saveAllBudgetsBtn.textContent = "Guardar presupuestos";
+      return;
+    }
+    await loadState(); renderApp();
+    showToast(`${toSave.length} presupuesto${toSave.length > 1 ? "s" : ""} guardado${toSave.length > 1 ? "s" : ""}`);
   });
 
   document.querySelectorAll("[data-set-budget]").forEach(btn => {
@@ -1653,6 +1711,86 @@ function openPayDebtModal(debtId) {
     modal.classList.remove("visible"); modal.innerHTML = "";
     await loadState(); renderApp();
     showToast("Pago registrado");
+  });
+}
+
+// ---------------------------------------------------------------
+// MODAL: AGREGAR CATEGORÍA A PRESUPUESTO
+// ---------------------------------------------------------------
+function openAddBudgetModal() {
+  const sinFijar = categories.filter(c => !state.budgets.find(b => b.category_id === c.id));
+  const modal = document.getElementById("logModal");
+  modal.classList.add("visible");
+  modal.innerHTML = `
+    <div class="modal-box">
+      <p class="step-label">Agregar presupuesto</p>
+      <label>Categoría</label>
+      <select id="newBudgetCat" style="margin-bottom:10px;">
+        <option value="" selected>Elige una categoría</option>
+        ${sinFijar.map(c => `<option value="${c.id}">${CATEGORY_ICONS[c.name] || "•"} ${c.name}</option>`).join("")}
+      </select>
+      <label>Límite mensual</label>
+      <input id="newBudgetAmount" type="number" step="1" min="0" placeholder="RD$0" style="margin-bottom:16px;" />
+      <div class="error-banner" id="nbErr"></div>
+      <div class="btn-row">
+        <button class="btn-secondary" id="cancelNewBudget">Cancelar</button>
+        <button class="btn-primary" id="saveNewBudget">Guardar</button>
+      </div>
+    </div>
+  `;
+  document.getElementById("cancelNewBudget").addEventListener("click", () => { modal.classList.remove("visible"); modal.innerHTML = ""; });
+  document.getElementById("saveNewBudget").addEventListener("click", async () => {
+    const catId = document.getElementById("newBudgetCat").value;
+    const amount = Number(document.getElementById("newBudgetAmount").value);
+    const errEl = document.getElementById("nbErr");
+    if (!catId) { errEl.textContent = "Elige una categoría."; errEl.classList.add("visible"); return; }
+    if (!amount || amount <= 0) { errEl.textContent = "Escribe un monto válido."; errEl.classList.add("visible"); return; }
+    const saveBtn = document.getElementById("saveNewBudget");
+    saveBtn.disabled = true; saveBtn.textContent = "Guardando…";
+    const { error } = await supabase.from("budgets").insert({
+      user_id: user.id, category_id: catId, amount, effective_from: new Date().toISOString().slice(0, 10),
+    });
+    if (error) { errEl.textContent = "No se pudo guardar. Intenta de nuevo."; errEl.classList.add("visible"); saveBtn.disabled = false; saveBtn.textContent = "Guardar"; return; }
+    modal.classList.remove("visible"); modal.innerHTML = "";
+    await loadState(); renderApp();
+    showToast("Presupuesto agregado");
+  });
+}
+
+// ---------------------------------------------------------------
+// MODAL: EDITAR PRESUPUESTO EXISTENTE
+// ---------------------------------------------------------------
+function openEditBudgetModal(budgetId, catId, currentAmount) {
+  const cat = categories.find(c => c.id === catId);
+  const modal = document.getElementById("logModal");
+  modal.classList.add("visible");
+  modal.innerHTML = `
+    <div class="modal-box">
+      <p class="step-label">Editar presupuesto</p>
+      <p style="font-size:13px; color:var(--text-secondary); margin:0 0 14px;">${CATEGORY_ICONS[cat?.name] || "•"} ${cat?.name || "Categoría"}</p>
+      <label>Nuevo límite mensual</label>
+      <input id="editBudgetAmount" type="number" step="1" min="0" value="${currentAmount}" style="margin-bottom:16px;" />
+      <div class="error-banner" id="ebErr"></div>
+      <div class="btn-row">
+        <button class="btn-secondary" id="cancelEditBudget">Cancelar</button>
+        <button class="btn-primary" id="saveEditBudget">Guardar</button>
+      </div>
+    </div>
+  `;
+  document.getElementById("cancelEditBudget").addEventListener("click", () => { modal.classList.remove("visible"); modal.innerHTML = ""; });
+  document.getElementById("saveEditBudget").addEventListener("click", async () => {
+    const amount = Number(document.getElementById("editBudgetAmount").value);
+    const errEl = document.getElementById("ebErr");
+    if (!amount || amount <= 0) { errEl.textContent = "Escribe un monto válido."; errEl.classList.add("visible"); return; }
+    const saveBtn = document.getElementById("saveEditBudget");
+    saveBtn.disabled = true; saveBtn.textContent = "Guardando…";
+    const today = new Date().toISOString().slice(0, 10);
+    const { error: closeErr } = await supabase.from("budgets").update({ effective_to: today }).eq("id", budgetId);
+    if (closeErr) { errEl.textContent = "No se pudo guardar. Intenta de nuevo."; errEl.classList.add("visible"); saveBtn.disabled = false; saveBtn.textContent = "Guardar"; return; }
+    await supabase.from("budgets").insert({ user_id: user.id, category_id: catId, amount, effective_from: today });
+    modal.classList.remove("visible"); modal.innerHTML = "";
+    await loadState(); renderApp();
+    showToast("Presupuesto actualizado");
   });
 }
 
