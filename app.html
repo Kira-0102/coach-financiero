@@ -719,29 +719,36 @@ function tplCoach() {
 
 function buildCoachContext() {
   const spentThisMonth = spentThisMonthTotal();
+  const bal = balance();
+  const disp = disponible(); // ingreso - fijos (plan mensual)
+  const disponibleRestante = Math.round(disp - spentThisMonth); // lo que le queda del plan
   const goalMonthlyNeeded = state.goals.length > 0 ? Math.round(totalGoalMonthlyPace()) : null;
 
-  // Resumen de presupuestos: cuánto tiene fijado y cuánto lleva gastado por categoría
+  // Metas: incluye progreso para que el coach pueda responder "¿cuánto me falta?"
+  const activeGoals = state.goals.filter(g => g.status !== "completed");
+  const goalSummary = activeGoals.length > 0
+    ? activeGoals.map(g => {
+        const falta = Math.max(0, Number(g.target_amount) - Number(g.current_amount));
+        return `"${g.name}" (tiene RD$${g.current_amount}, le falta RD$${falta})`;
+      }).join("; ")
+    : null;
+
   const budgetSummary = state.budgets.length > 0
     ? state.budgets.map(b => {
         const cat = categories.find(c => c.id === b.category_id);
         const spent = spentThisMonthByCategory(b.category_id);
-        const remaining = Number(b.amount) - spent;
-        return `${cat?.name || "Sin categoría"}: límite RD$${b.amount}, gastado RD$${Math.round(spent)}, queda RD$${Math.round(remaining)}`;
+        const remaining = Math.round(Number(b.amount) - spent);
+        return `${cat?.name || "Sin categoría"}: queda RD$${remaining} de RD$${b.amount}`;
       }).join("; ")
     : null;
 
   return {
-    balance: Math.round(balance()),
-    disponible: Math.round(disponible()),
-    spentThisMonth: Math.round(spentThisMonth),
+    balance: Math.round(bal),
+    disponibleRestante,
     income: Math.round(monthlyIncome()),
     payFrequency: state.profile.pay_frequency,
-    totalFixed: Math.round(totalFixed()),
-    goalSummary: state.goals.length > 0
-      ? state.goals.filter(g => g.status !== "completed").map(g => `"${g.name}" (RD$${g.current_amount} de RD$${g.target_amount}, ${g.target_months} meses)`).join("; ")
-      : null,
-    goalCount: state.goals.filter(g => g.status !== "completed").length,
+    goalSummary,
+    goalCount: activeGoals.length,
     goalMonthlyNeeded,
     budgetSummary,
     debtsSummary: state.debts.length > 0
