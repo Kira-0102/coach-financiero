@@ -741,50 +741,64 @@ function buildCoachContext() {
   const bal = balance();
   const income = monthlyIncome();
   const fixed = totalFixed();
-  const disp = disponible(); // ingreso - fijos
+  const disp = disponible();
   const spent = spentThisMonthTotal();
   const dispRestante = Math.max(0, disp - spent);
   const goalPace = totalGoalMonthlyPace();
   const debts = state.debts;
-  const goals = state.goals.filter(g => g.status !== "completed");
+  const activeGoals = state.goals.filter(g => g.status !== "completed");
 
   // ========== CÁLCULOS DEL COACH ==========
   
-  // Cuánto puede gastar en discrecional sin afectar metas
   const safeDiscretionary = Math.max(0, dispRestante - goalPace);
-  // Máximo para UNA sola compra (50% de lo seguro)
   const maxSinglePurchase = Math.round(safeDiscretionary * 0.5);
   
-  // Obligaciones mensuales totales
   const minDebtPayments = debts.reduce((s, d) => s + (d.minimum_payment || 0), 0);
   const monthlyObligations = goalPace + minDebtPayments + fixed;
   
-  // Nivel de riesgo
   const riskLevel = income > 0 && monthlyObligations > income * 0.9 ? "ALTO"
     : monthlyObligations > income * 0.75 ? "MEDIO" : "BAJO";
   
-  // Deudas urgentes (>30% interés)
   const urgentDebts = debts.filter(d => d.interest_rate > 30 && d.current_balance > 0);
   const hasUrgentDebt = urgentDebts.length > 0;
   
-  // Fondo de emergencia (3 meses de gastos fijos)
   const emergencyTarget = fixed * 3;
   const emergencyGap = Math.max(0, emergencyTarget - bal);
   const hasEmergencyFund = emergencyGap === 0;
   
-  // Metas en riesgo
-  const goalsAtRisk = goals.filter(g => {
+  const goalsAtRisk = activeGoals.filter(g => {
     const pace = goalMonthlyPace(g);
     return pace > 0 && dispRestante > 0 && pace > dispRestante * 0.5;
   });
 
-  // Score de libertad (0-100)
   const freedomScore = income > 0 
     ? Math.round(Math.max(0, Math.min(100, (safeDiscretionary / income) * 200)))
     : 0;
 
+  // ========== FIX: Metas detalladas ==========
+  const goalsDetailed = activeGoals.map(g => {
+    const falta = Math.max(0, Number(g.target_amount) - Number(g.current_amount));
+    const pace = goalMonthlyPace(g);
+    return {
+      name: g.name,
+      target: Number(g.target_amount),
+      current: Number(g.current_amount),
+      remaining: falta,
+      monthlyNeeded: Math.round(pace),
+      monthsLeft: goalMonthsLeft(g),
+      priority: g.priority,
+      progress: Math.round((Number(g.current_amount) / Number(g.target_amount)) * 100)
+    };
+  });
+
+  // Detectar meta de fondo de emergencia
+  const emergencyGoal = activeGoals.find(g => 
+    g.name.toLowerCase().includes("emergencia") || 
+    g.name.toLowerCase().includes("emergency")
+  );
+
   return {
-    // Datos básicos (para referencia de la IA)
+    // Datos básicos
     balance: Math.round(bal),
     income: Math.round(income),
     fixedExpenses: Math.round(fixed),
@@ -793,21 +807,38 @@ function buildCoachContext() {
     availableRemaining: Math.round(dispRestante),
     goalMonthlyTotal: Math.round(goalPace),
     
-    // ========== ANÁLISIS DEL COACH (lo que la Edge Function usa) ==========
+    // ========== FIX: Metas con detalle completo ==========
+    goalCount: activeGoals.length,
+    goalSummary: activeGoals.length > 0
+      ? activeGoals.map(g => {
+          const falta = Math.max(0, Number(g.target_amount) - Number(g.current_amount));
+          return `"${g.name}": RD$${g.current_amount} de RD$${g.target_amount} (falta RD$${falta}, aporte mensual RD$${Math.round(goalMonthlyPace(g))})`;
+        }).join("; ")
+      : "NINGUNA META ACTIVA",
     
+    // FIX: Metas detalladas para que la IA no diga "no tengo información"
+    goalsDetailed,
+    
+    // FIX: Meta de emergencia específica
+    emergencyGoal: emergencyGoal ? {
+      name: emergencyGoal.name,
+      target: Number(emergencyGoal.target_amount),
+      current: Number(emergencyGoal.current_amount),
+      remaining: Math.max(0, Number(emergencyGoal.target_amount) - Number(emergencyGoal.current_amount)),
+      monthlyNeeded: Math.round(goalMonthlyPace(emergencyGoal)),
+      isFunded: Number(emergencyGoal.current_amount) >= Number(emergencyGoal.target_amount)
+    } : null,
+    
+    // ========== ANÁLISIS DEL COACH ==========
     coachAnalysis: {
-      // Respuesta directa a "¿me puedo comprar algo?"
       canBuyDiscretionary: safeDiscretionary > 0,
       safeDiscretionaryAmount: Math.round(safeDiscretionary),
       maxRecommendedSinglePurchase: Math.round(maxSinglePurchase),
       freedomScore,
-      
-      // Estado financiero
       riskLevel,
       monthlyObligations: Math.round(monthlyObligations),
       obligationsAsPercentOfIncome: income > 0 ? Math.round((monthlyObligations / income) * 100) : 0,
       
-      // Bloqueos (el coach NUNCA debe ignorar estos)
       blockers: {
         hasUrgentDebt,
         urgentDebtNames: urgentDebts.map(d => d.name),
@@ -819,7 +850,6 @@ function buildCoachContext() {
         goalsAtRiskNames: goalsAtRisk.map(g => g.name),
       },
       
-      // Textos pre-armados para consistencia
       purchaseAdvice: {
         canAfford: safeDiscretionary > 0 
           ? `Tenés RD$${Math.round(safeDiscretionary)} para gastos discrecionales este mes.`
@@ -837,20 +867,10 @@ function buildCoachContext() {
       }
     },
     
-    // Resumen de metas (para el prompt de situación)
-    goalSummary: goals.length > 0
-      ? goals.map(g => {
-          const falta = Math.max(0, Number(g.target_amount) - Number(g.current_amount));
-          return `"${g.name}" (RD$${g.current_amount} de RD$${g.target_amount}, falta RD$${falta})`;
-        }).join("; ")
-      : "ninguna",
-    
-    // Resumen de deudas (para el prompt de situación)
     debtsSummary: debts.length > 0
       ? debts.map(d => `${d.name}: RD$${d.current_balance}${d.interest_rate ? ` (${d.interest_rate}%)` : ""}`).join("; ")
       : "ninguna",
     
-    // Presupuestos (para el prompt de situación)
     budgetSummary: state.budgets.length > 0
       ? state.budgets.map(b => {
           const cat = categories.find(c => c.id === b.category_id);
