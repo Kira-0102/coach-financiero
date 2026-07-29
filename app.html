@@ -738,42 +738,127 @@ function tplCoach() {
 }
 
 function buildCoachContext() {
-  const spentThisMonth = spentThisMonthTotal();
   const bal = balance();
-  const disp = disponible(); // ingreso - fijos (plan mensual)
-  const disponibleRestante = Math.round(disp - spentThisMonth); // lo que le queda del plan
-  const goalMonthlyNeeded = state.goals.length > 0 ? Math.round(totalGoalMonthlyPace()) : null;
+  const income = monthlyIncome();
+  const fixed = totalFixed();
+  const disp = disponible(); // ingreso - fijos
+  const spent = spentThisMonthTotal();
+  const dispRestante = Math.max(0, disp - spent);
+  const goalPace = totalGoalMonthlyPace();
+  const debts = state.debts;
+  const goals = state.goals.filter(g => g.status !== "completed");
 
-  // Metas: incluye progreso para que el coach pueda responder "¿cuánto me falta?"
-  const activeGoals = state.goals.filter(g => g.status !== "completed");
-  const goalSummary = activeGoals.length > 0
-    ? activeGoals.map(g => {
-        const falta = Math.max(0, Number(g.target_amount) - Number(g.current_amount));
-        return `"${g.name}" (tiene RD$${g.current_amount}, le falta RD$${falta})`;
-      }).join("; ")
-    : null;
+  // ========== CÁLCULOS DEL COACH ==========
+  
+  // Cuánto puede gastar en discrecional sin afectar metas
+  const safeDiscretionary = Math.max(0, dispRestante - goalPace);
+  // Máximo para UNA sola compra (50% de lo seguro)
+  const maxSinglePurchase = Math.round(safeDiscretionary * 0.5);
+  
+  // Obligaciones mensuales totales
+  const minDebtPayments = debts.reduce((s, d) => s + (d.minimum_payment || 0), 0);
+  const monthlyObligations = goalPace + minDebtPayments + fixed;
+  
+  // Nivel de riesgo
+  const riskLevel = income > 0 && monthlyObligations > income * 0.9 ? "ALTO"
+    : monthlyObligations > income * 0.75 ? "MEDIO" : "BAJO";
+  
+  // Deudas urgentes (>30% interés)
+  const urgentDebts = debts.filter(d => d.interest_rate > 30 && d.current_balance > 0);
+  const hasUrgentDebt = urgentDebts.length > 0;
+  
+  // Fondo de emergencia (3 meses de gastos fijos)
+  const emergencyTarget = fixed * 3;
+  const emergencyGap = Math.max(0, emergencyTarget - bal);
+  const hasEmergencyFund = emergencyGap === 0;
+  
+  // Metas en riesgo
+  const goalsAtRisk = goals.filter(g => {
+    const pace = goalMonthlyPace(g);
+    return pace > 0 && dispRestante > 0 && pace > dispRestante * 0.5;
+  });
 
-  const budgetSummary = state.budgets.length > 0
-    ? state.budgets.map(b => {
-        const cat = categories.find(c => c.id === b.category_id);
-        const spent = spentThisMonthByCategory(b.category_id);
-        const remaining = Math.round(Number(b.amount) - spent);
-        return `${cat?.name || "Sin categoría"}: queda RD$${remaining} de RD$${b.amount}`;
-      }).join("; ")
-    : null;
+  // Score de libertad (0-100)
+  const freedomScore = income > 0 
+    ? Math.round(Math.max(0, Math.min(100, (safeDiscretionary / income) * 200)))
+    : 0;
 
   return {
+    // Datos básicos (para referencia de la IA)
     balance: Math.round(bal),
-    disponibleRestante,
-    income: Math.round(monthlyIncome()),
-    payFrequency: state.profile.pay_frequency,
-    goalSummary,
-    goalCount: activeGoals.length,
-    goalMonthlyNeeded,
-    budgetSummary,
-    debtsSummary: state.debts.length > 0
-      ? state.debts.map(d => `${d.name}: debe RD$${d.current_balance}`).join("; ")
-      : null,
+    income: Math.round(income),
+    fixedExpenses: Math.round(fixed),
+    availableTotal: Math.round(disp),
+    alreadySpent: Math.round(spent),
+    availableRemaining: Math.round(dispRestante),
+    goalMonthlyTotal: Math.round(goalPace),
+    
+    // ========== ANÁLISIS DEL COACH (lo que la Edge Function usa) ==========
+    
+    coachAnalysis: {
+      // Respuesta directa a "¿me puedo comprar algo?"
+      canBuyDiscretionary: safeDiscretionary > 0,
+      safeDiscretionaryAmount: Math.round(safeDiscretionary),
+      maxRecommendedSinglePurchase: Math.round(maxSinglePurchase),
+      freedomScore,
+      
+      // Estado financiero
+      riskLevel,
+      monthlyObligations: Math.round(monthlyObligations),
+      obligationsAsPercentOfIncome: income > 0 ? Math.round((monthlyObligations / income) * 100) : 0,
+      
+      // Bloqueos (el coach NUNCA debe ignorar estos)
+      blockers: {
+        hasUrgentDebt,
+        urgentDebtNames: urgentDebts.map(d => d.name),
+        urgentDebtTotal: Math.round(urgentDebts.reduce((s, d) => s + d.current_balance, 0)),
+        missingEmergencyFund: !hasEmergencyFund,
+        emergencyGap: Math.round(emergencyGap),
+        emergencyTarget: Math.round(emergencyTarget),
+        goalsAtRiskCount: goalsAtRisk.length,
+        goalsAtRiskNames: goalsAtRisk.map(g => g.name),
+      },
+      
+      // Textos pre-armados para consistencia
+      purchaseAdvice: {
+        canAfford: safeDiscretionary > 0 
+          ? `Tenés RD$${Math.round(safeDiscretionary)} para gastos discrecionales este mes.`
+          : `No tenés margen para gastos discrecionales este mes.`,
+        maxSingle: `Máximo recomendado para una compra: RD$${Math.round(maxSinglePurchase)}.`,
+        ifUrgentDebt: hasUrgentDebt 
+          ? `Pero tenés deuda urgente que crece más rápido que cualquier compra.` 
+          : null,
+        ifNoEmergency: !hasEmergencyFund 
+          ? `Pero necesitás RD$${Math.round(emergencyGap)} más para tu fondo de emergencia.` 
+          : null,
+        ifGoalsAtRisk: goalsAtRisk.length > 0 
+          ? `Pero tus metas ${goalsAtRisk.map(g => g.name).join(", ")} están en riesgo.` 
+          : null
+      }
+    },
+    
+    // Resumen de metas (para el prompt de situación)
+    goalSummary: goals.length > 0
+      ? goals.map(g => {
+          const falta = Math.max(0, Number(g.target_amount) - Number(g.current_amount));
+          return `"${g.name}" (RD$${g.current_amount} de RD$${g.target_amount}, falta RD$${falta})`;
+        }).join("; ")
+      : "ninguna",
+    
+    // Resumen de deudas (para el prompt de situación)
+    debtsSummary: debts.length > 0
+      ? debts.map(d => `${d.name}: RD$${d.current_balance}${d.interest_rate ? ` (${d.interest_rate}%)` : ""}`).join("; ")
+      : "ninguna",
+    
+    // Presupuestos (para el prompt de situación)
+    budgetSummary: state.budgets.length > 0
+      ? state.budgets.map(b => {
+          const cat = categories.find(c => c.id === b.category_id);
+          const spent = spentThisMonthByCategory(b.category_id);
+          const remaining = Math.round(Number(b.amount) - spent);
+          return `${cat?.name || "Sin categoría"}: RD$${remaining} de RD$${b.amount}`;
+        }).join("; ")
+      : "no tiene"
   };
 }
 
