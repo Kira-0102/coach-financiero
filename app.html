@@ -1334,12 +1334,15 @@ function buildCoachContext() {
     : null;
 
   const nextPay = nextPayInfo();
+  const freq = state.profile?.pay_frequency;
 
   return {
     balance: Math.round(bal),
     disponibleRestante,
-    income: Math.round(monthlyIncome()),
-    payFrequency: state.profile?.pay_frequency,
+    income: Math.round(monthlyIncome()),       // ingreso mensual TOTAL (normalizado)
+    perPaycheck: Math.round(monthlyIncome() / (freq === "biweekly" ? 2 : 1)), // lo que ENTRA cada cobro
+    payFrequency: freq,
+    payFrequencyLabel: freq === "biweekly" ? "quincenal" : "mensual",
     totalFixed: Math.round(totalFixed()),
     nextPay: nextPay ? `en ${nextPay.dias} día${nextPay.dias !== 1 ? "s" : ""} (${nextPay.fecha}) por ${money(nextPay.monto)}` : null,
     goalSummary,
