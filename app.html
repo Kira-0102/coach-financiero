@@ -253,6 +253,41 @@ function goalStatusLabel(status) {
     : { text: "En curso", color: "var(--teal)", bg: "var(--teal-light)" };
 }
 
+// Calcula días hasta el próximo cobro y la fecha estimada
+// basándose en pay_day_1, pay_day_2 y pay_frequency del perfil.
+function nextPayInfo() {
+  const p = state.profile;
+  if (!p?.pay_day_1) return null; // días no configurados
+
+  const today = new Date();
+  const day = today.getDate();
+  const month = today.getMonth();
+  const year = today.getFullYear();
+
+  const days = p.pay_frequency === "biweekly" && p.pay_day_2
+    ? [p.pay_day_1, p.pay_day_2].sort((a, b) => a - b)
+    : [p.pay_day_1];
+
+  // Encontrar el próximo día de cobro
+  let nextDate = null;
+  for (const d of days) {
+    const candidate = new Date(year, month, d);
+    if (candidate > today) { nextDate = candidate; break; }
+  }
+  // Si ninguno en este mes, el primero del mes siguiente
+  if (!nextDate) nextDate = new Date(year, month + 1, days[0]);
+
+  const diffMs = nextDate - today;
+  const diffDays = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
+  const amount = Math.round(monthlyIncome() / (p.pay_frequency === "biweekly" ? 1 : 1));
+
+  return {
+    dias: diffDays,
+    fecha: nextDate.toLocaleDateString("es-DO", { day: "numeric", month: "long" }),
+    monto: amount,
+  };
+}
+
 function totalFixed() {
   return state.fixed.reduce((s, f) => s + Number(f.estimated_amount), 0);
 }
@@ -824,12 +859,15 @@ function buildCoachContext() {
       }).join("; ")
     : null;
 
+  const nextPay = nextPayInfo();
+
   return {
     balance: Math.round(bal),
     disponibleRestante,
     income: Math.round(monthlyIncome()),
     payFrequency: state.profile?.pay_frequency,
     totalFixed: Math.round(totalFixed()),
+    nextPay: nextPay ? `en ${nextPay.dias} día${nextPay.dias !== 1 ? "s" : ""} (${nextPay.fecha}) por ${money(nextPay.monto)}` : null,
     goalSummary,
     goalCount: activeGoals.length,
     goalMonthlyNeeded,
@@ -1343,6 +1381,8 @@ function tplInicio() {
 
 function tplIngreso() {
   const freq = state.profile.pay_frequency || "monthly";
+  const d1 = state.profile.pay_day_1 ?? "";
+  const d2 = state.profile.pay_day_2 ?? "";
   return `
     <h1 style="text-align:left; margin-bottom:4px;">Tu perfil</h1>
     <p style="font-size:11px; color:var(--text-muted); margin:0 0 16px;">Tu nombre y cuánto ganas. Esto afecta todos los cálculos de la app.</p>
@@ -1357,7 +1397,28 @@ function tplIngreso() {
     </div>
 
     <label id="ingAmountLabel">${freq === "biweekly" ? "¿Cuánto ganas cada quincena?" : "¿Cuánto ganas al mes?"}</label>
-    <input id="ingAmount" type="number" step="1" min="0" value="${state.profile.declared_monthly_income ?? ""}" style="margin-bottom:16px;" />
+    <input id="ingAmount" type="number" step="1" min="0" value="${state.profile.declared_monthly_income ?? ""}" style="margin-bottom:14px;" />
+
+    <div id="ingDaysSection">
+      ${freq === "biweekly" ? `
+        <label>¿Qué días cobras? <span style="color:var(--text-muted);">(opcional pero recomendado)</span></label>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:4px;">
+          <div>
+            <label style="font-size:11px; color:var(--text-muted);">Primer cobro (día del mes)</label>
+            <input id="ingDay1" type="number" step="1" min="1" max="31" placeholder="Ej. 15" value="${d1}" style="margin-bottom:0;" />
+          </div>
+          <div>
+            <label style="font-size:11px; color:var(--text-muted);">Segundo cobro (día del mes)</label>
+            <input id="ingDay2" type="number" step="1" min="1" max="31" placeholder="Ej. 30" value="${d2}" style="margin-bottom:0;" />
+          </div>
+        </div>
+        <p class="hint" style="margin-bottom:14px;">Con estas fechas el coach puede decirte cuántos días faltan para tu próximo cobro.</p>
+      ` : `
+        <label>¿Qué día cobras? <span style="color:var(--text-muted);">(opcional)</span></label>
+        <input id="ingDay1" type="number" step="1" min="1" max="31" placeholder="Ej. 30" value="${d1}" style="margin-bottom:4px;" />
+        <p class="hint" style="margin-bottom:14px;">Con este dato el coach puede calcular cuántos días faltan para tu cobro.</p>
+      `}
+    </div>
 
     <div class="error-banner" id="ingErr"></div>
     <button class="btn-primary" id="saveIngresoBtn" style="width:100%;">Guardar</button>
@@ -1369,6 +1430,29 @@ function wireIngreso() {
   if (!grid) return;
   let selectedFreq = state.profile.pay_frequency || "monthly";
 
+  function refreshDaysSection(freq) {
+    const d1 = state.profile.pay_day_1 ?? "";
+    const d2 = state.profile.pay_day_2 ?? "";
+    document.getElementById("ingDaysSection").innerHTML = freq === "biweekly" ? `
+      <label>¿Qué días cobras? <span style="color:var(--text-muted);">(opcional pero recomendado)</span></label>
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:4px;">
+        <div>
+          <label style="font-size:11px; color:var(--text-muted);">Primer cobro (día del mes)</label>
+          <input id="ingDay1" type="number" step="1" min="1" max="31" placeholder="Ej. 15" value="${d1}" style="margin-bottom:0;" />
+        </div>
+        <div>
+          <label style="font-size:11px; color:var(--text-muted);">Segundo cobro (día del mes)</label>
+          <input id="ingDay2" type="number" step="1" min="1" max="31" placeholder="Ej. 30" value="${d2}" style="margin-bottom:0;" />
+        </div>
+      </div>
+      <p class="hint" style="margin-bottom:14px;">Con estas fechas el coach puede decirte cuántos días faltan para tu próximo cobro.</p>
+    ` : `
+      <label>¿Qué día cobras? <span style="color:var(--text-muted);">(opcional)</span></label>
+      <input id="ingDay1" type="number" step="1" min="1" max="31" placeholder="Ej. 30" value="${d1}" style="margin-bottom:4px;" />
+      <p class="hint" style="margin-bottom:14px;">Con este dato el coach puede calcular cuántos días faltan para tu cobro.</p>
+    `;
+  }
+
   grid.querySelectorAll(".type-option").forEach(el => {
     el.addEventListener("click", () => {
       selectedFreq = el.dataset.f;
@@ -1376,31 +1460,40 @@ function wireIngreso() {
       el.classList.add("selected");
       document.getElementById("ingAmountLabel").textContent =
         selectedFreq === "biweekly" ? "¿Cuánto ganas cada quincena?" : "¿Cuánto ganas al mes?";
+      refreshDaysSection(selectedFreq);
     });
   });
 
   document.getElementById("saveIngresoBtn").addEventListener("click", async () => {
     const displayName = document.getElementById("ingName").value.trim();
     const amount = document.getElementById("ingAmount").value;
+    const day1 = document.getElementById("ingDay1")?.value;
+    const day2 = document.getElementById("ingDay2")?.value;
     const errEl = document.getElementById("ingErr");
     if (!amount || Number(amount) <= 0) {
-      errEl.textContent = "Poné un monto válido.";
+      errEl.textContent = "Pon un monto válido.";
       errEl.classList.add("visible");
       return;
     }
+    const saveBtn = document.getElementById("saveIngresoBtn");
+    saveBtn.disabled = true; saveBtn.textContent = "Guardando…";
     const { error } = await supabase.from("profiles").update({
       display_name: displayName || null,
-      declared_monthly_income: Number(amount), pay_frequency: selectedFreq,
+      declared_monthly_income: Number(amount),
+      pay_frequency: selectedFreq,
+      pay_day_1: day1 ? Number(day1) : null,
+      pay_day_2: (selectedFreq === "biweekly" && day2) ? Number(day2) : null,
     }).eq("id", user.id);
     if (error) {
-      errEl.textContent = "No se pudo guardar. Intentá de nuevo.";
+      errEl.textContent = "No se pudo guardar. Intenta de nuevo.";
       errEl.classList.add("visible");
+      saveBtn.disabled = false; saveBtn.textContent = "Guardar";
       return;
     }
     await loadState();
     tab = "mas";
     renderApp();
-    showToast("Ingreso actualizado");
+    showToast("Perfil actualizado");
   });
 }
 
