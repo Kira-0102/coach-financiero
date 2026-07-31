@@ -192,6 +192,15 @@ function goalMonthlyPace(g) {
 
 // Suma el ritmo mensual necesario de TODAS las metas activas — porque
 // todas compiten por el mismo disponible, no alcanza con mirar una sola.
+// P2: Cálculo correcto de cuota con interés (fórmula PMT estándar).
+// PMT = P × i × (1+i)^n / ((1+i)^n − 1)
+// Sin tasa de interés, degrada a simple división.
+function calcPMT(principal, annualRatePct, periods) {
+  if (!annualRatePct || annualRatePct <= 0 || !periods) return principal / periods;
+  const i = annualRatePct / 100 / 12;
+  return principal * i * Math.pow(1 + i, periods) / (Math.pow(1 + i, periods) - 1);
+}
+
 function goalPriorityLabel(priority) {
   if (priority === "critical") return "🔴 Alta";
   if (priority === "important") return "🟡 Media";
@@ -484,7 +493,7 @@ function renderOnboardingFixed() {
         <p class="hint">Uno por vez — escribe el nombre, toca "+ Agregar", y repite para el siguiente.</p>
         <label>Categoría</label>
         <select id="fCat" style="margin-bottom:8px;">
-          <option value="" selected>Elegí una categoría</option>
+          <option value="" selected>Selecciona una categoría</option>
           ${categories.map(c => `<option value="${c.id}">${c.name}</option>`).join("")}
         </select>
         <input id="fAmount" type="number" step="1" min="0" placeholder="RD$0" style="margin-bottom:10px;" />
@@ -689,8 +698,8 @@ function backLink() {
 
 function tplMas() {
   const items = [
-    { tab: "ingreso", icon: "💰", label: "Perfil e ingreso", desc: "Tu nombre y cuánto ganas" },
-    { tab: "gastos", icon: "🧾", label: "Gastos", desc: "Ver, editar y borrar tus movimientos" },
+    { tab: "ingreso", icon: "💰", label: "Perfil", desc: "Tu nombre y cuánto ganas" },
+    { tab: "gastos", icon: "🧾", label: "Movimientos", desc: "Gastos e ingresos del mes" },
     { tab: "metas", icon: "🎯", label: "Metas", desc: "Tus objetivos de ahorro" },
     { tab: "fijos", icon: "💳", label: "Gastos fijos", desc: "Lo que se repite cada mes" },
     { tab: "deudas", icon: "📄", label: "Deudas", desc: "Tarjetas, préstamos, financiamientos" },
@@ -738,147 +747,96 @@ function tplCoach() {
 }
 
 function buildCoachContext() {
+  const spentThisMonth = spentThisMonthTotal();
   const bal = balance();
-  const income = monthlyIncome();
-  const fixed = totalFixed();
   const disp = disponible();
-  const spent = spentThisMonthTotal();
-  const dispRestante = Math.max(0, disp - spent);
-  const goalPace = totalGoalMonthlyPace();
-  const debts = state.debts;
+  const disponibleRestante = Math.round(disp - spentThisMonth);
+  const goalMonthlyNeeded = state.goals.length > 0 ? Math.round(totalGoalMonthlyPace()) : null;
   const activeGoals = state.goals.filter(g => g.status !== "completed");
 
-  // ========== CÁLCULOS DEL COACH ==========
-  
-  const safeDiscretionary = Math.max(0, dispRestante - goalPace);
-  const maxSinglePurchase = Math.round(safeDiscretionary * 0.5);
-  
-  const minDebtPayments = debts.reduce((s, d) => s + (d.minimum_payment || 0), 0);
-  const monthlyObligations = goalPace + minDebtPayments + fixed;
-  
-  const riskLevel = income > 0 && monthlyObligations > income * 0.9 ? "ALTO"
-    : monthlyObligations > income * 0.75 ? "MEDIO" : "BAJO";
-  
-  const urgentDebts = debts.filter(d => d.interest_rate > 30 && d.current_balance > 0);
-  const hasUrgentDebt = urgentDebts.length > 0;
-  
-  const emergencyTarget = fixed * 3;
-  const emergencyGap = Math.max(0, emergencyTarget - bal);
-  const hasEmergencyFund = emergencyGap === 0;
-  
-  const goalsAtRisk = activeGoals.filter(g => {
-    const pace = goalMonthlyPace(g);
-    return pace > 0 && dispRestante > 0 && pace > dispRestante * 0.5;
-  });
+  // P17: datos estructurados para que el modelo razone mejor con hechos, no solo texto
+  const structured = {
+    perfil: {
+      ingreso_mensual: Math.round(monthlyIncome()),
+      frecuencia_cobro: state.profile?.pay_frequency === "biweekly" ? "quincenal" : "mensual",
+      saldo_actual: Math.round(bal),
+      disponible_restante_este_mes: disponibleRestante,
+    },
+    // P12: gastos fijos explícitos — antes el coach decía "no tengo info"
+    gastos_fijos: state.fixed.map(f => ({
+      nombre: f.name,
+      monto: Number(f.estimated_amount),
+      categoria: f.categories?.name || "Sin categoría",
+    })),
+    total_gastos_fijos: Math.round(totalFixed()),
+    gastos_variables_mes: Math.round(spentThisMonth),
+    metas: activeGoals.map(g => ({
+      nombre: g.name,
+      objetivo: Number(g.target_amount),
+      ahorrado: Number(g.current_amount),
+      falta: Math.max(0, Number(g.target_amount) - Number(g.current_amount)),
+      aporte_mensual_necesario: Math.round(goalMonthlyPace(g)),
+    })),
+    deudas: state.debts.map(d => ({
+      nombre: d.name,
+      tipo: d.debt_type,
+      saldo_pendiente: Number(d.current_balance),
+      tasa_interes_anual: d.interest_rate ? Number(d.interest_rate) : null,
+      cuota_mensual: d.minimum_payment ? Math.round(d.minimum_payment) : null,
+    })),
+    presupuestos: state.budgets.map(b => {
+      const cat = categories.find(c => c.id === b.category_id);
+      const spent = spentThisMonthByCategory(b.category_id);
+      return {
+        categoria: cat?.name || "Sin categoría",
+        limite: Number(b.amount),
+        gastado: Math.round(spent),
+        disponible: Math.round(Number(b.amount) - spent),
+      };
+    }),
+  };
 
-  const freedomScore = income > 0 
-    ? Math.round(Math.max(0, Math.min(100, (safeDiscretionary / income) * 200)))
-    : 0;
+  // Resúmenes en lenguaje natural (compactos, para el prompt de texto)
+  const goalSummary = activeGoals.length > 0
+    ? activeGoals.map(g => {
+        const falta = Math.max(0, Number(g.target_amount) - Number(g.current_amount));
+        return `"${g.name}" (tiene RD$${g.current_amount}, le falta RD$${falta})`;
+      }).join("; ")
+    : null;
 
-  // ========== FIX: Metas detalladas ==========
-  const goalsDetailed = activeGoals.map(g => {
-    const falta = Math.max(0, Number(g.target_amount) - Number(g.current_amount));
-    const pace = goalMonthlyPace(g);
-    return {
-      name: g.name,
-      target: Number(g.target_amount),
-      current: Number(g.current_amount),
-      remaining: falta,
-      monthlyNeeded: Math.round(pace),
-      monthsLeft: goalMonthsLeft(g),
-      priority: g.priority,
-      progress: Math.round((Number(g.current_amount) / Number(g.target_amount)) * 100)
-    };
-  });
+  const fixedSummary = state.fixed.length > 0
+    ? state.fixed.map(f => `${f.name} RD$${f.estimated_amount}`).join(", ")
+    : null;
 
-  // Detectar meta de fondo de emergencia
-  const emergencyGoal = activeGoals.find(g => 
-    g.name.toLowerCase().includes("emergencia") || 
-    g.name.toLowerCase().includes("emergency")
-  );
+  const budgetSummary = state.budgets.length > 0
+    ? state.budgets.map(b => {
+        const cat = categories.find(c => c.id === b.category_id);
+        const remaining = Math.round(Number(b.amount) - spentThisMonthByCategory(b.category_id));
+        return `${cat?.name || "Sin categoría"}: queda RD$${remaining} de RD$${b.amount}`;
+      }).join("; ")
+    : null;
+
+  const debtsSummary = state.debts.length > 0
+    ? state.debts.map(d => {
+        const tasa = d.interest_rate ? ` al ${d.interest_rate}% anual` : "";
+        const cuota = d.minimum_payment ? ` (cuota: RD$${Math.round(d.minimum_payment)}/mes)` : "";
+        return `${d.name}: debe RD$${d.current_balance}${tasa}${cuota}`;
+      }).join("; ")
+    : null;
 
   return {
-    // Datos básicos
     balance: Math.round(bal),
-    income: Math.round(income),
-    fixedExpenses: Math.round(fixed),
-    availableTotal: Math.round(disp),
-    alreadySpent: Math.round(spent),
-    availableRemaining: Math.round(dispRestante),
-    goalMonthlyTotal: Math.round(goalPace),
-    
-    // ========== FIX: Metas con detalle completo ==========
+    disponibleRestante,
+    income: Math.round(monthlyIncome()),
+    payFrequency: state.profile?.pay_frequency,
+    totalFixed: Math.round(totalFixed()),
+    goalSummary,
     goalCount: activeGoals.length,
-    goalSummary: activeGoals.length > 0
-      ? activeGoals.map(g => {
-          const falta = Math.max(0, Number(g.target_amount) - Number(g.current_amount));
-          return `"${g.name}": RD$${g.current_amount} de RD$${g.target_amount} (falta RD$${falta}, aporte mensual RD$${Math.round(goalMonthlyPace(g))})`;
-        }).join("; ")
-      : "NINGUNA META ACTIVA",
-    
-    // FIX: Metas detalladas para que la IA no diga "no tengo información"
-    goalsDetailed,
-    
-    // FIX: Meta de emergencia específica
-    emergencyGoal: emergencyGoal ? {
-      name: emergencyGoal.name,
-      target: Number(emergencyGoal.target_amount),
-      current: Number(emergencyGoal.current_amount),
-      remaining: Math.max(0, Number(emergencyGoal.target_amount) - Number(emergencyGoal.current_amount)),
-      monthlyNeeded: Math.round(goalMonthlyPace(emergencyGoal)),
-      isFunded: Number(emergencyGoal.current_amount) >= Number(emergencyGoal.target_amount)
-    } : null,
-    
-    // ========== ANÁLISIS DEL COACH ==========
-    coachAnalysis: {
-      canBuyDiscretionary: safeDiscretionary > 0,
-      safeDiscretionaryAmount: Math.round(safeDiscretionary),
-      maxRecommendedSinglePurchase: Math.round(maxSinglePurchase),
-      freedomScore,
-      riskLevel,
-      monthlyObligations: Math.round(monthlyObligations),
-      obligationsAsPercentOfIncome: income > 0 ? Math.round((monthlyObligations / income) * 100) : 0,
-      
-      blockers: {
-        hasUrgentDebt,
-        urgentDebtNames: urgentDebts.map(d => d.name),
-        urgentDebtTotal: Math.round(urgentDebts.reduce((s, d) => s + d.current_balance, 0)),
-        missingEmergencyFund: !hasEmergencyFund,
-        emergencyGap: Math.round(emergencyGap),
-        emergencyTarget: Math.round(emergencyTarget),
-        goalsAtRiskCount: goalsAtRisk.length,
-        goalsAtRiskNames: goalsAtRisk.map(g => g.name),
-      },
-      
-      purchaseAdvice: {
-        canAfford: safeDiscretionary > 0 
-          ? `Tenés RD$${Math.round(safeDiscretionary)} para gastos discrecionales este mes.`
-          : `No tenés margen para gastos discrecionales este mes.`,
-        maxSingle: `Máximo recomendado para una compra: RD$${Math.round(maxSinglePurchase)}.`,
-        ifUrgentDebt: hasUrgentDebt 
-          ? `Pero tenés deuda urgente que crece más rápido que cualquier compra.` 
-          : null,
-        ifNoEmergency: !hasEmergencyFund 
-          ? `Pero necesitás RD$${Math.round(emergencyGap)} más para tu fondo de emergencia.` 
-          : null,
-        ifGoalsAtRisk: goalsAtRisk.length > 0 
-          ? `Pero tus metas ${goalsAtRisk.map(g => g.name).join(", ")} están en riesgo.` 
-          : null
-      }
-    },
-    
-    debtsSummary: debts.length > 0
-      ? debts.map(d => `${d.name}: RD$${d.current_balance}${d.interest_rate ? ` (${d.interest_rate}%)` : ""}`).join("; ")
-      : "ninguna",
-    
-    budgetSummary: state.budgets.length > 0
-      ? state.budgets.map(b => {
-          const cat = categories.find(c => c.id === b.category_id);
-          const spent = spentThisMonthByCategory(b.category_id);
-          const remaining = Math.round(Number(b.amount) - spent);
-          return `${cat?.name || "Sin categoría"}: RD$${remaining} de RD$${b.amount}`;
-        }).join("; ")
-      : "no tiene"
+    goalMonthlyNeeded,
+    fixedSummary,
+    budgetSummary,
+    debtsSummary,
+    structured,
   };
 }
 
@@ -972,7 +930,7 @@ function tplSimular() {
       ` : ""}
     </div>
     <button id="askCoachBtn" class="btn-secondary" style="width:100%; margin-top:12px;">💬 Preguntarle al coach sobre esto</button>
-    <p style="font-size:11px; color:var(--text-muted); text-align:center; margin-top:10px;">El slider es un cálculo instantáneo tuyo. El coach lo interpreta cuando se lo pedís.</p>
+    <p style="font-size:11px; color:var(--text-muted); text-align:center; margin-top:10px;">El slider es un cálculo instantáneo tuyo. El coach lo interpreta cuando se lo pides.</p>
   `;
 }
 
@@ -1027,10 +985,13 @@ function wireSimulador() {
 
   const askCoachBtn = document.getElementById("askCoachBtn");
   if (askCoachBtn) askCoachBtn.addEventListener("click", () => {
-    const amount = Number(amountInput.value);
+    // Lee el valor AHORA del input, no el de la última vez que corrió update().
+    // Esto evita que un pegado desde portapapeles produzca amount=0 en el mensaje.
+    const amountNow = Number(document.getElementById("simAmountInput")?.value) || 0;
     const itemName = document.getElementById("simItemName").value.trim().replace(/"/g, "'").replace(/[<>]/g, "");
     const thing = itemName ? `en ${itemName}` : "en algo";
-    let msg = `Estoy pensando en gastar ${money(amount)} ${thing}. Ya gasté ${money(alreadySpent)} este mes, así que con esto me quedarían ${money(disponible() - alreadySpent - amount)} de disponible.`;
+    const quedaría = Math.round(disponible() - alreadySpent - amountNow);
+    let msg = `Estoy pensando en gastar ${money(amountNow)} ${thing}. Ya gasté ${money(alreadySpent)} este mes, así que con esto me quedarían ${money(quedaría)} de disponible.`;
     if (state.goals.length === 1) msg += ` ¿Cómo afecta esto a mi meta "${state.goals[0].name}"?`;
     else if (state.goals.length > 1) msg += ` ¿Cómo afecta esto a mis metas (${state.goals.map(gl => gl.name).join(", ")})?`;
     msg += " ¿Qué opinas?";
@@ -1210,7 +1171,7 @@ function tplGastos() {
       return `
       <div class="card row-between" style="margin-bottom:6px; padding:10px 12px;">
         <span>${icon} ${esc(label)}
-          <span style="color:var(--text-muted); font-size:11px;"> · ${new Date(t.occurred_at).toLocaleDateString("es-DO", { day: "numeric", month: "short" })}</span>
+          <span style="color:var(--text-muted); font-size:11px;"> · ${new Date(t.occurred_at).toLocaleDateString("es-DO", { day: "numeric", month: "short", year: "numeric" })}</span>
         </span>
         <span style="display:flex; align-items:center; gap:10px;">
           <span style="color:${isIncome ? 'var(--success-text)' : 'inherit'};">${isIncome ? "+" : "-"}${money(Math.abs(t.amount))}</span>
@@ -1318,7 +1279,7 @@ function fixedAddForm() {
       <input id="newFName" placeholder="Ej. Netflix" style="margin-bottom:8px;" />
       <label>Categoría</label>
       <select id="newFCat" style="margin-bottom:8px;">
-        <option value="" selected>Elegí una categoría</option>
+        <option value="" selected>Selecciona una categoría</option>
         ${categories.map(c => `<option value="${c.id}">${c.name}</option>`).join("")}
       </select>
       <input id="newFAmount" type="number" step="1" min="0" placeholder="RD$0" style="margin-bottom:8px;" />
@@ -1376,7 +1337,7 @@ function debtAddForm() {
       <input id="newDName" placeholder="Ej. Tarjeta Banco X" style="margin-bottom:8px;" />
       <label for="newDType">Tipo de deuda</label>
       <select id="newDType" style="margin-bottom:8px;">
-        <option value="" selected>Elegí un tipo</option>
+        <option value="" selected>Selecciona un tipo</option>
         ${DEBT_TYPES.map(t => `<option value="${t.value}">${t.icon} ${t.label}</option>`).join("")}
       </select>
       <input id="newDAmount" type="number" step="1" min="0" placeholder="Monto total de la deuda" style="margin-bottom:8px;" />
@@ -1655,7 +1616,7 @@ function wireTabEvents() {
     if (!name || !debtType || !amount) { alert("Completá el nombre, el tipo y el monto."); return; }
     if (interest && Number(interest) < 0) { alert("La tasa de interés no puede ser negativa."); return; }
     const minimumPayment = installments && Number(installments) > 0
-      ? Number(amount) / Number(installments)
+      ? Math.round(calcPMT(Number(amount), Number(interest) || 0, Number(installments)))
       : null;
     const { error } = await supabase.from("debts").insert({
       user_id: user.id, name, debt_type: debtType,
@@ -1824,16 +1785,38 @@ function openPayDebtModal(debtId) {
   const d = state.debts.find(x => x.id === debtId);
   const modal = document.getElementById("logModal");
   modal.classList.add("visible");
+
+  // P2: cuota sugerida con PMT real, no división simple
+  const cuotaSugerida = d.minimum_payment ? Math.round(d.minimum_payment) : null;
+
+  // Calcular total de intereses restantes si mantiene la cuota sugerida
+  let interesInfo = "";
+  if (cuotaSugerida && d.interest_rate && Number(d.interest_rate) > 0) {
+    const i = Number(d.interest_rate) / 100 / 12;
+    const bal = Number(d.current_balance);
+    if (cuotaSugerida > bal * i) {
+      const cuotas = Math.ceil(Math.log(cuotaSugerida / (cuotaSugerida - bal * i)) / Math.log(1 + i));
+      const totalIntereses = Math.round((cuotaSugerida * cuotas) - bal);
+      if (totalIntereses > 0 && cuotas > 0 && isFinite(cuotas)) {
+        interesInfo = `<p style="font-size:11px;color:var(--text-muted);margin:0 0 12px;line-height:1.5;">
+          Con esta cuota terminas en <strong>${cuotas} meses</strong> pagando <strong>${money(totalIntereses)}</strong> en intereses.
+        </p>`;
+      }
+    }
+  }
+
   modal.innerHTML = `
     <div class="modal-box">
       <p class="step-label">Registrar pago — ${esc(d.name)}</p>
       <p style="font-size:12px; color:var(--text-muted); text-align:center; margin:0 0 14px;">Debes ${money(d.current_balance)} ahora mismo.</p>
-      <label>Monto que pagaste</label>
-      <input id="payAmount" type="number" step="1" min="0" value="${d.minimum_payment ? d.minimum_payment : ""}" style="margin-bottom:16px;" />
+      <label>Monto a pagar</label>
+      <input id="payAmount" type="number" step="1" min="0" value="${cuotaSugerida ?? ""}" placeholder="RD$0" style="margin-bottom:4px;" />
+      ${cuotaSugerida ? `<p style="font-size:11px;color:var(--text-muted);margin:0 0 8px;">Cuota sugerida: ${money(cuotaSugerida)} — puedes cambiarla.</p>` : ""}
+      ${interesInfo}
       <div class="error-banner" id="payErr"></div>
       <div class="btn-row">
         <button class="btn-secondary" id="cancelPay">Cancelar</button>
-        <button class="btn-primary" id="savePay">Registrar</button>
+        <button class="btn-primary" id="savePay">Registrar pago</button>
       </div>
     </div>
   `;
