@@ -658,7 +658,7 @@ function renderApp() {
       <div class="bottom-nav">
         <button class="nav-item ${tab === "inicio" ? "active" : ""}" data-tab="inicio"><span class="icon">🏠</span>Inicio</button>
         <button class="nav-item ${tab === "coach" ? "active" : ""}" data-tab="coach"><span class="icon">💬</span>Coach</button>
-        <button class="nav-item ${tab === "simular" ? "active" : ""}" data-tab="simular"><span class="icon">🧮</span>Simular</button>
+        <button class="nav-item ${tab === "simular" ? "active" : ""}" data-tab="simular"><span class="icon">🤔</span>¿Lo compro?</button>
         <button class="nav-item ${["mas","ingreso","gastos","fijos","deudas","presup"].includes(tab) ? "active" : ""}" data-tab="mas"><span class="icon">☰</span>Más</button>
       </div>
     </div>
@@ -890,119 +890,306 @@ function wireCoach() {
   if (msgs) msgs.scrollTop = msgs.scrollHeight;
 }
 
-function tplSimular() {
-  const goalLabel = state.goals.length === 0 ? null
-    : state.goals.length === 1 ? `Impacto en "${state.goals[0].name}"`
-    : `Impacto en tus ${state.goals.length} metas`;
-  return `
-    <h1 style="text-align:center; margin-bottom:14px;">¿Qué pasa si compro esto?</h1>
-    <div class="card" id="simCard">
-      <label style="text-align:center; display:block;">¿En qué? <span style="color:var(--text-muted);">(opcional)</span></label>
-      <input type="text" id="simItemName" placeholder="Ej. Tenis" style="text-align:center; margin-bottom:14px;" />
+// ================================================================
+// MOTOR DE DECISIÓN — buildPurchaseAnalysis(amount, itemName)
+// Función pura que centraliza todos los cálculos del módulo
+// "¿Lo compro?". Alimenta la UI, el coach y los botones de acción.
+// Ninguna dimensión inventa información — si no hay datos, lo dice.
+// ================================================================
+function buildPurchaseAnalysis(amount, itemName) {
+  const bal       = balance();
+  const disp      = disponible();
+  const spent     = spentThisMonthTotal();
+  const dispRest  = disp - spent;
+  const afterPurchase = dispRest - amount;
+  const balAfter  = bal - amount;
+  const income    = monthlyIncome();
+  const activeGoals = state.goals.filter(g => g.status !== "completed");
+  const goalPace  = totalGoalMonthlyPace();
 
+  // --- A. LIQUIDEZ ---
+  let liquidityScore, liquidityMsg;
+  if (amount === 0) {
+    liquidityScore = 10;
+    liquidityMsg = "Ingresa un monto para ver el análisis de liquidez.";
+  } else if (bal < amount) {
+    liquidityScore = 1;
+    liquidityMsg = `No tienes RD$${money(amount).replace("RD$","")} en tu cuenta ahora mismo (tienes ${money(bal)}). No podrías pagar esto hoy.`;
+  } else {
+    const pctRestante = bal > 0 ? balAfter / bal : 0;
+    liquidityScore = pctRestante >= 0.5 ? 9 : pctRestante >= 0.3 ? 7 : pctRestante >= 0.1 ? 4 : 2;
+    const daysInMonth = new Date(new Date().getFullYear(), new Date().getMonth()+1, 0).getDate();
+    const dayOfMonth  = new Date().getDate();
+    const daysLeft    = daysInMonth - dayOfMonth;
+    const dailyRate   = daysLeft > 0 ? balAfter / daysLeft : 0;
+    liquidityMsg = bal >= amount
+      ? `Te quedarían ${money(balAfter)} en cuenta. Eso equivale a ~${money(Math.round(dailyRate))}/día por los ${daysLeft} días restantes del mes.`
+      : `No tienes fondos suficientes ahora mismo.`;
+  }
+
+  // --- B. METAS ---
+  let goalsScore, goalsMsg;
+  if (activeGoals.length === 0) {
+    goalsScore = 8;
+    goalsMsg = "No tienes metas activas. Esta compra no afecta ningún objetivo de ahorro.";
+  } else if (amount === 0) {
+    goalsScore = 8;
+    goalsMsg = "Ingresa un monto para ver el impacto en tus metas.";
+  } else if (afterPurchase >= goalPace) {
+    goalsScore = 9;
+    goalsMsg = `Después de la compra te quedan ${money(Math.round(afterPurchase))} disponibles — suficiente para cubrir el aporte mensual de tus metas (${money(Math.round(goalPace))}).`;
+  } else if (afterPurchase >= 0) {
+    const shortfall = goalPace - afterPurchase;
+    const daysDelay = Math.ceil((shortfall / income) * 30);
+    goalsMsg = `Te faltarían ${money(Math.round(shortfall))} para cubrir tus metas este mes. Eso equivale a ~${daysDelay} días de retraso.`;
+    goalsScore = 4;
+  } else {
+    goalsMsg = `Esta compra supera tu disponible mensual (${money(Math.round(dispRest))}). Afectaría directamente tus metas.`;
+    goalsScore = 2;
+  }
+
+  // --- C. HÁBITOS (Fase 2 — sin historial real aún) ---
+  const habitsScore = 7;
+  const habitsMsg   = "Todavía no hay suficiente historial para detectar patrones de comportamiento.";
+
+  // --- D. OPORTUNIDAD ---
+  let opportunityItems = [];
+  if (amount > 0) {
+    if (state.debts.length > 0) {
+      const topDebt = [...state.debts].sort((a,b) => (Number(b.interest_rate)||0) - (Number(a.interest_rate)||0))[0];
+      if (topDebt) opportunityItems.push(`Abonar ${money(amount)} a tu deuda "${topDebt.name}" (${topDebt.interest_rate ?? "?"}% anual)`);
+    }
+    if (activeGoals.length > 0) {
+      const topGoal = activeGoals[0];
+      const falta = Math.max(0, Number(topGoal.target_amount) - Number(topGoal.current_amount));
+      if (amount <= falta) opportunityItems.push(`Aportar ${money(amount)} a tu meta "${topGoal.name}"`);
+    }
+    const fondoNecesario = totalFixed() * 3;
+    const fondoActual = bal;
+    if (fondoActual < fondoNecesario) opportunityItems.push(`Fortalecer tu fondo de emergencia (te faltan ~${money(Math.round(fondoNecesario - fondoActual))})`);
+  }
+
+  // --- E. BIENESTAR ---
+  let wellbeingScore, wellbeingMsg;
+  const saludable = computeBaselineScore() >= 60;
+  if (amount === 0) {
+    wellbeingScore = 8;
+    wellbeingMsg   = "Ingresa un monto para evaluar el impacto en tu bienestar financiero.";
+  } else if (bal >= amount && afterPurchase >= 0 && saludable) {
+    wellbeingScore = 9;
+    wellbeingMsg   = "Tus finanzas siguen saludables incluso realizando esta compra. Tienes margen.";
+  } else if (bal >= amount && afterPurchase >= 0) {
+    wellbeingScore = 6;
+    wellbeingMsg   = "La compra es viable, pero ajusta tus gastos el resto del mes para no quedarte corto.";
+  } else {
+    wellbeingScore = 3;
+    wellbeingMsg   = "Esta compra pone presión en tus finanzas este mes. Considera esperarla o buscar una alternativa.";
+  }
+
+  // --- SCORE Y VEREDICTO GLOBAL ---
+  const score = amount === 0 ? 0 : Math.min(100, Math.round(
+    liquidityScore * 30 +
+    goalsScore     * 35 +
+    habitsScore    * 10 +
+    wellbeingScore * 25
+  ));
+  const stars   = score >= 85 ? 5 : score >= 70 ? 4 : score >= 55 ? 3 : score >= 40 ? 2 : 1;
+  const verdict = score >= 70 ? "green" : score >= 45 ? "yellow" : "red";
+
+  const verdictLabel = verdict === "green"
+    ? "🟢 Compra recomendable"
+    : verdict === "yellow"
+    ? "🟡 Puedes comprarlo, pero reducirá tu margen"
+    : "🔴 No es recomendable en este momento";
+
+  const summary = amount === 0
+    ? "Ingresa el monto para analizar la compra."
+    : verdict === "green"
+    ? `Con ${money(amount)} tienes liquidez suficiente y tus metas no se ven afectadas.`
+    : verdict === "yellow"
+    ? `La compra es posible pero ajusta el resto del mes para no comprometer tus metas.`
+    : `Esta compra compromete tu liquidez o tus metas en este momento.`;
+
+  // Mensaje precargado para el coach
+  const itemText = itemName ? `en ${itemName}` : "en algo";
+  const coachPrompt = amount > 0
+    ? `Analicé una compra de ${money(amount)} ${itemText}. El motor de decisión le dio un score de ${score}/100 (${verdictLabel.replace(/🟢|🟡|🔴/g,"").trim()}). ¿Me das tu opinión considerando mis metas y deudas actuales?`
+    : "";
+
+  return {
+    verdict, score, stars, verdictLabel, summary, coachPrompt,
+    dimensions: {
+      liquidez:    { score: liquidityScore * 10, msg: liquidityMsg },
+      metas:       { score: goalsScore * 10,     msg: goalsMsg },
+      habitos:     { score: habitsScore * 10,    msg: habitsMsg },
+      oportunidad: { items: opportunityItems },
+      bienestar:   { score: wellbeingScore * 10, msg: wellbeingMsg },
+    },
+    actions: {
+      canBuy:           bal >= amount && amount > 0,
+      registerPurchase: bal >= amount && amount > 0,
+      saveWishlist:     amount > 0,
+    },
+    meta: { amount, itemName, balAfter, dispRestante: dispRest, afterPurchase },
+  };
+}
+
+// ================================================================
+// UI — tplSimular (nueva pantalla "¿Lo compro?")
+// ================================================================
+function tplSimular() {
+  return `
+    <h1 style="text-align:center; margin-bottom:4px;">¿Lo compro?</h1>
+    <p style="text-align:center; font-size:12px; color:var(--text-muted); margin:0 0 14px;">Analiza cualquier compra antes de decidir.</p>
+
+    <div class="card" style="margin-bottom:10px;">
+      <label style="text-align:center; display:block; font-size:11px; color:var(--text-muted);">¿En qué? (opcional)</label>
+      <input type="text" id="simItemName" placeholder="Ej. Tenis" style="text-align:center; margin-bottom:10px;" />
       <div style="display:flex; align-items:center; justify-content:center; gap:6px; margin-bottom:6px;">
-        <span style="font-size:28px; font-weight:600; color:var(--teal);">RD$</span>
-        <input type="number" step="1" min="0" id="simAmountInput" value="" placeholder="0" style="font-size:28px; font-weight:600; color:var(--teal); text-align:center; width:140px; border:none; padding:2px; margin-bottom:0;" />
+        <span style="font-size:28px; font-weight:500; color:var(--teal);">RD$</span>
+        <input type="number" step="1" min="0" id="simAmountInput" value="" placeholder="0"
+          style="font-size:28px; font-weight:500; color:var(--teal); text-align:center; width:140px; border:none; padding:2px; margin-bottom:0;" />
       </div>
-      <input type="range" id="simSlider" min="0" max="${Math.max(disponible() * 2, 3000)}" step="50" value="0" style="width:100%; margin-bottom:16px;" />
-      <div class="row-between" style="background:white; border-radius:10px; padding:10px 12px; margin-bottom:8px;">
-        <span style="font-size:12px; color:var(--text-secondary);">Saldo real ahora</span>
-        <span style="font-size:12px; font-weight:500;">${money(balance())}</span>
-      </div>
-      <div class="row-between" style="background:white; border-radius:10px; padding:10px 12px; margin-bottom:8px;">
-        <span style="font-size:12px; color:var(--text-secondary);">Disponible este mes</span>
-        <span style="font-size:12px; font-weight:500;">${money(disponible())}</span>
-      </div>
-      <div class="row-between" style="background:white; border-radius:10px; padding:10px 12px; margin-bottom:8px;">
-        <span style="font-size:12px; color:var(--text-secondary);">Ya gastaste este mes</span>
-        <span style="font-size:12px; font-weight:500;">${money(spentThisMonthTotal())}</span>
-      </div>
-      <div class="row-between" style="background:white; border-radius:10px; padding:10px 12px;">
-        <span style="font-size:12px; color:var(--text-secondary);">Te quedaría (según tu plan)</span>
-        <span id="simRemaining" style="font-size:12px; font-weight:500;">${money(disponible() - spentThisMonthTotal())}</span>
-      </div>
-      <div id="simBalanceWarning" style="display:none;"></div>
-      ${goalLabel ? `
-        <div class="row-between" style="background:white; border-radius:10px; padding:10px 12px; margin-top:8px;">
-          <span style="font-size:12px; color:var(--text-secondary);">${goalLabel}</span>
-          <span id="simGoalImpact" style="font-size:12px; font-weight:500;"></span>
-        </div>
-      ` : ""}
+      <input type="range" id="simSlider" min="0" max="${Math.max(disponible() * 2, 10000)}" step="100" value="0" style="width:100%; margin-bottom:0;" />
     </div>
-    <button id="askCoachBtn" class="btn-secondary" style="width:100%; margin-top:12px;">💬 Preguntarle al coach sobre esto</button>
-    <p style="font-size:11px; color:var(--text-muted); text-align:center; margin-top:10px;">El slider es un cálculo instantáneo tuyo. El coach lo interpreta cuando se lo pides.</p>
+
+    <div id="decisionResult"></div>
   `;
 }
 
+function renderDecisionCard(analysis) {
+  const { verdict, score, stars, verdictLabel, summary, dimensions, actions, meta } = analysis;
+
+  const verdictColor = verdict === "green"
+    ? "var(--success-text)" : verdict === "yellow"
+    ? "var(--warning-text)" : "var(--danger-text)";
+  const verdictBg = verdict === "green"
+    ? "var(--success-bg)" : verdict === "yellow"
+    ? "var(--warning-bg)" : "var(--danger-bg)";
+
+  const starsHtml = Array.from({length:5}, (_,i) =>
+    `<span style="color:${i < stars ? 'var(--gold)' : 'var(--border)'}; font-size:18px;">★</span>`
+  ).join("");
+
+  const dimHtml = [
+    { label: "💧 Liquidez",   d: dimensions.liquidez  },
+    { label: "🎯 Metas",      d: dimensions.metas     },
+    { label: "🧠 Hábitos",    d: dimensions.habitos   },
+    { label: "💚 Bienestar",  d: dimensions.bienestar },
+  ].map(({ label, d }) => `
+    <div style="padding:10px 0; border-bottom:0.5px solid var(--border);">
+      <div class="row-between" style="margin-bottom:4px;">
+        <span style="font-size:12px; font-weight:500;">${label}</span>
+        <span style="font-size:11px; color:${d.score >= 70 ? 'var(--success-text)' : d.score >= 45 ? 'var(--warning-text)' : 'var(--danger-text)'};">
+          ${d.score}/100
+        </span>
+      </div>
+      <p style="font-size:11px; color:var(--text-muted); margin:0; line-height:1.5;">${d.msg}</p>
+    </div>
+  `).join("");
+
+  const opportunityHtml = dimensions.oportunidad.items.length > 0
+    ? `<div style="padding:10px 0; border-bottom:0.5px solid var(--border);">
+         <p style="font-size:12px; font-weight:500; margin:0 0 6px;">💡 Con ${money(meta.amount)} también podrías:</p>
+         ${dimensions.oportunidad.items.map(i => `<p style="font-size:11px; color:var(--text-muted); margin:0 0 3px; line-height:1.5;">• ${i}</p>`).join("")}
+       </div>`
+    : "";
+
+  return `
+    <div class="card" style="background:${verdictBg}; margin-bottom:10px;">
+      <div style="text-align:center; margin-bottom:8px;">${starsHtml}</div>
+      <p style="font-size:15px; font-weight:500; color:${verdictColor}; text-align:center; margin:0 0 6px;">${verdictLabel}</p>
+      <p style="font-size:12px; color:${verdictColor}; text-align:center; margin:0; opacity:0.85; line-height:1.5;">${summary}</p>
+    </div>
+
+    <div class="card" style="margin-bottom:10px; padding:0 12px;">
+      ${dimHtml}
+      ${opportunityHtml}
+    </div>
+
+    <div style="display:flex; gap:8px; margin-bottom:8px;">
+      <button id="askCoachBtn" class="btn-secondary" style="flex:1;">💬 ¿Por qué?</button>
+      ${actions.registerPurchase
+        ? `<button id="simBuyBtn" class="btn-primary" style="flex:1;">✓ Lo compré</button>`
+        : ""}
+    </div>
+    ${actions.saveWishlist
+      ? `<button id="simSaveBtn" class="btn-secondary" style="width:100%; font-size:12px;">🔖 Guardar para después</button>`
+      : ""}
+  `;
+}
+
+// ================================================================
+// WIRE — conecta el motor con la UI
+// ================================================================
 function wireSimulador() {
-  const slider = document.getElementById("simSlider");
+  const slider      = document.getElementById("simSlider");
   const amountInput = document.getElementById("simAmountInput");
-  if (!slider) return;
-  const monthlyGoalContribution = totalGoalMonthlyPace();
-  const alreadySpent = spentThisMonthTotal();
-  const sliderMax = Number(slider.max);
+  const resultEl    = document.getElementById("decisionResult");
+  if (!slider || !resultEl) return;
 
   function update(val) {
     val = Math.max(0, Number(val) || 0);
-    slider.value = Math.min(val, sliderMax);
-    amountInput.value = val;
+    slider.value = Math.min(val, Number(slider.max));
+    amountInput.value = val || "";
 
-    const remaining = disponible() - alreadySpent - val;
-    const remainingEl = document.getElementById("simRemaining");
-    remainingEl.textContent = money(remaining);
-    remainingEl.style.color = remaining < 0 ? "var(--danger-text)" : "inherit";
+    const itemName = document.getElementById("simItemName")?.value.trim() || "";
+    const analysis = buildPurchaseAnalysis(val, itemName);
+    resultEl.innerHTML = val > 0 ? renderDecisionCard(analysis) : "";
 
-    const impactEl = document.getElementById("simGoalImpact");
-    if (impactEl) {
-      if (remaining >= monthlyGoalContribution || monthlyGoalContribution === 0) {
-        impactEl.textContent = "Sin cambios";
-        impactEl.style.color = "var(--success-text)";
-      } else {
-        const shortfall = monthlyGoalContribution - Math.max(0, remaining);
-        const extraMonths = Math.ceil(shortfall / monthlyGoalContribution);
-        impactEl.textContent = `+${extraMonths} mes${extraMonths > 1 ? "es" : ""} de retraso`;
-        impactEl.style.color = "var(--warning-text)";
-      }
-    }
-
-    const warnEl = document.getElementById("simBalanceWarning");
-    if (balance() < val) {
-      warnEl.style.display = "flex";
-      warnEl.style.gap = "8px";
-      warnEl.style.background = "var(--danger-bg)";
-      warnEl.style.borderRadius = "10px";
-      warnEl.style.padding = "10px 12px";
-      warnEl.style.marginTop = "8px";
-      warnEl.innerHTML = `<span>⚠️</span><p style="font-size:12px; color:var(--danger-text); margin:0; line-height:1.5;">Aunque tu plan mensual lo permite, hoy no tienes ${money(val)} en tu cuenta real (tienes ${money(balance())}). No puedes hacer esta compra en este momento.</p>`;
-    } else {
-      warnEl.style.display = "none";
-    }
+    if (val > 0) wireDecisionActions(analysis);
   }
 
   slider.addEventListener("input", () => update(slider.value));
   amountInput.addEventListener("input", () => update(amountInput.value));
+  document.getElementById("simItemName")?.addEventListener("input", () => {
+    const val = Number(amountInput.value) || 0;
+    if (val > 0) update(val);
+  });
   update(0);
+}
 
-  const askCoachBtn = document.getElementById("askCoachBtn");
-  if (askCoachBtn) askCoachBtn.addEventListener("click", () => {
-    // Lee el valor AHORA del input, no el de la última vez que corrió update().
-    // Esto evita que un pegado desde portapapeles produzca amount=0 en el mensaje.
-    const amountNow = Number(document.getElementById("simAmountInput")?.value) || 0;
-    const itemName = document.getElementById("simItemName").value.trim().replace(/"/g, "'").replace(/[<>]/g, "");
-    const thing = itemName ? `en ${itemName}` : "en algo";
-    const quedaría = Math.round(disponible() - alreadySpent - amountNow);
-    let msg = `Estoy pensando en gastar ${money(amountNow)} ${thing}. Ya gasté ${money(alreadySpent)} este mes, así que con esto me quedarían ${money(quedaría)} de disponible.`;
-    if (state.goals.length === 1) msg += ` ¿Cómo afecta esto a mi meta "${state.goals[0].name}"?`;
-    else if (state.goals.length > 1) msg += ` ¿Cómo afecta esto a mis metas (${state.goals.map(gl => gl.name).join(", ")})?`;
-    msg += " ¿Qué opinas?";
+function wireDecisionActions(analysis) {
+  // "¿Por qué?" → abre el coach con el análisis precargado
+  const askBtn = document.getElementById("askCoachBtn");
+  if (askBtn) askBtn.addEventListener("click", () => {
+    if (!analysis.coachPrompt) return;
     tab = "coach";
     renderApp();
     const input = document.getElementById("coachInput");
     if (input) {
-      input.value = msg;
+      input.value = analysis.coachPrompt;
       input.focus();
-      input.setSelectionRange(0, 0);
-      input.scrollLeft = 0;
+    }
+  });
+
+  // "Lo compré" → registra como gasto real reutilizando el flujo existente
+  const buyBtn = document.getElementById("simBuyBtn");
+  if (buyBtn) buyBtn.addEventListener("click", () => {
+    openLogModal(analysis.meta.amount, analysis.meta.itemName);
+  });
+
+  // "Guardar para después" → guarda en purchase_decisions
+  const saveBtn = document.getElementById("simSaveBtn");
+  if (saveBtn) saveBtn.addEventListener("click", async () => {
+    saveBtn.disabled = true;
+    saveBtn.textContent = "Guardando…";
+    const { error } = await supabase.from("purchase_decisions").insert({
+      user_id: user.id,
+      item_name: analysis.meta.itemName || null,
+      amount: analysis.meta.amount,
+      verdict: analysis.verdict,
+      score: analysis.score,
+      status: "saved",
+      analysis_snapshot: analysis,
+    });
+    if (error) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = "🔖 Guardar para después";
+      showToast("No se pudo guardar. Intenta de nuevo.");
+    } else {
+      showToast("Guardado en tu lista de deseos");
+      saveBtn.textContent = "✓ Guardado";
     }
   });
 }
@@ -2347,7 +2534,7 @@ function openIncomeModal() {
 // ---------------------------------------------------------------
 // MODAL: REGISTRO RÁPIDO
 // ---------------------------------------------------------------
-function openLogModal() {
+function openLogModal(prefillAmount = null, prefillNote = null) {
   const modal = document.getElementById("logModal");
   let selectedCat = null;
 
@@ -2367,7 +2554,9 @@ function openLogModal() {
     modal.innerHTML = `
       <div class="modal-box">
         <p class="step-label">Nuevo gasto</p>
-        <input id="logAmount" type="number" step="1" min="0" placeholder="RD$0" style="text-align:center; font-size:24px; margin-bottom:14px;" />
+        <input id="logAmount" type="number" step="1" min="0" placeholder="RD$0"
+          value="${prefillAmount ?? ""}"
+          style="text-align:center; font-size:24px; margin-bottom:14px;" />
         <label>Categoría</label>
         <div class="cat-grid">
           ${categories.map(c => `<div class="cat-option ${selectedCat === c.id ? "selected" : ""}" data-cat="${c.id}">${CATEGORY_ICONS[c.name] || "•"}<br>${c.name}</div>`).join("")}
