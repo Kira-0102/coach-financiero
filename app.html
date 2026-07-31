@@ -951,24 +951,56 @@ function buildPurchaseAnalysis(amount, itemName) {
   const dayOfMonth  = new Date().getDate();
   const daysLeft    = Math.max(1, daysInMonth - dayOfMonth);
 
-  // --- P1+P2: JERARQUÍA DE DECISIÓN ---
-  // La liquidez es crítica: si el saldo no alcanza, el veredicto nunca
-  // puede ser verde sin importar las demás dimensiones.
+  // BUG 3 FIX: detectar si el ingreso todavía no ha entrado (bigGap)
+  // Si el saldo real es mucho menor que el disponible planeado,
+  // probablemente la quincena/sueldo aún no ha caído.
+  const bigGap = dispRest - bal > Math.max(dispRest * 0.3, 500) && dispRest > 0;
 
-  // 1. LIQUIDEZ (peso 35% — más alto por P2)
+  // BUG 1+2 FIX: calcular saldo proyectado con próximo cobro
+  const nextPay = nextPayInfo();
+  const cobrarPronto = nextPay !== null && nextPay.dias <= 5;
+  const balProyectado = cobrarPronto ? bal + nextPay.monto : bal;
+  const balAfterProyectado = balProyectado - amount;
+
+  // Para el análisis de liquidez, usar el saldo más favorable:
+  // si cobra en ≤5 días, evaluar con el saldo proyectado post-cobro.
+  const balEfectivo = cobrarPronto ? balProyectado : bal;
+  const balAfterEfectivo = balEfectivo - amount;
+
+  // BUG 4 FIX: si el saldo real es negativo, el dispRest planeado
+  // no refleja la situación real. Usar el menor de los dos.
+  const dispRestReal = Math.min(dispRest, bal > 0 ? dispRest : dispRest + bal);
+
+  // 1. LIQUIDEZ (peso 35%)
   let liqS, liqLabel, liqMsg;
   if (amount === 0) {
     liqS = 100; liqLabel = "—";
     liqMsg = "Ingresa un monto para ver el análisis de liquidez.";
-  } else if (bal < amount) {
-    liqS = 5; liqLabel = "Muy baja";
-    liqMsg = `Hoy no tienes ${money(amount)} en tu cuenta (tienes ${money(bal)}). No podrías pagar esto ahora mismo.`;
+  } else if (balEfectivo < amount) {
+    // No alcanza ni con el cobro proyectado
+    if (cobrarPronto && bal < amount) {
+      liqS = 20; liqLabel = "Muy baja";
+      liqMsg = `Hoy tienes ${money(bal)} en cuenta, pero cobras en ${nextPay.dias} día${nextPay.dias > 1 ? "s" : ""} (${money(nextPay.monto)}). Aún así, después del cobro no alcanzaría para ${money(amount)}.`;
+    } else if (cobrarPronto) {
+      liqS = 65; liqLabel = "Buena";
+      liqMsg = `Hoy tienes ${money(bal)}, pero cobras en ${nextPay.dias} día${nextPay.dias > 1 ? "s" : ""} (${money(nextPay.monto)}). Con ese cobro tendrías ${money(balProyectado)} — suficiente.`;
+    } else {
+      liqS = 5; liqLabel = "Muy baja";
+      liqMsg = bigGap
+        ? `Hoy no tienes ${money(amount)} en cuenta (tienes ${money(bal)}). Parece que tu ingreso de este período aún no ha entrado.`
+        : `Hoy no tienes ${money(amount)} en cuenta (tienes ${money(bal)}). No podrías pagar esto ahora mismo.`;
+    }
   } else {
-    const pct = balAfter / bal;
+    // Sí alcanza con el saldo efectivo
+    const pct = balAfterEfectivo / balEfectivo;
     liqS = pct >= 0.6 ? 90 : pct >= 0.4 ? 75 : pct >= 0.2 ? 55 : pct >= 0.05 ? 35 : 15;
     liqLabel = scoreLabel(liqS);
-    const daily = balAfter / daysLeft;
-    liqMsg = `Te quedarían ${money(balAfter)} en cuenta. Eso equivale a ~${money(Math.round(daily))}/día por los ${daysLeft} días restantes del mes.`;
+    if (cobrarPronto && bal < amount) {
+      liqMsg = `Hoy tienes ${money(bal)}, pero cobras en ${nextPay.dias} día${nextPay.dias > 1 ? "s" : ""} (${money(nextPay.monto)}). Con ese cobro tendrías ${money(balProyectado)} y te quedarían ${money(balAfterEfectivo)}.`;
+    } else {
+      const daily = balAfterEfectivo / daysLeft;
+      liqMsg = `Te quedarían ${money(Math.round(balAfterEfectivo))} en cuenta. Eso equivale a ~${money(Math.round(daily))}/día por los ${daysLeft} días restantes del mes.`;
+    }
   }
 
   // 2. DEUDAS (peso 20% — P4: nueva dimensión)
@@ -1021,10 +1053,12 @@ function buildPurchaseAnalysis(amount, itemName) {
   if (amount === 0) {
     wellS = 80; wellLabel = "—";
     wellMsg = "Ingresa un monto para evaluar el impacto en tu bienestar financiero.";
-  } else if (bal >= amount && afterPurch >= 0 && saludable) {
+  } else if (balEfectivo >= amount && afterPurch >= 0 && saludable) {
     wellS = 90; wellLabel = "Excelente";
-    wellMsg = "Tus finanzas siguen saludables incluso realizando esta compra. Tienes margen para este gasto.";
-  } else if (bal >= amount && afterPurch >= 0) {
+    wellMsg = cobrarPronto && bal < amount
+      ? `Aunque hoy el saldo está ajustado, cobras pronto y tus finanzas se mantienen saludables con esta compra.`
+      : "Tus finanzas siguen saludables incluso realizando esta compra. Tienes margen para este gasto.";
+  } else if (balEfectivo >= amount && afterPurch >= 0) {
     wellS = 60; wellLabel = "Buena";
     wellMsg = "La compra es posible. Ajusta tus gastos variables el resto del mes para mantener el equilibrio.";
   } else {
@@ -1038,12 +1072,28 @@ function buildPurchaseAnalysis(amount, itemName) {
     liqS * 0.35 + debtS * 0.20 + goalsS * 0.25 + habitsS * 0.10 + wellS * 0.10;
   const score = Math.round(rawScore);
 
-  // P2: REGLA CRÍTICA — si no hay liquidez, el veredicto no puede ser verde
+  // VEREDICTO FINAL — jerarquía de liquidez con cobro proyectado
+  // Reglas en orden de prioridad:
+  // 1. Si ni con el cobro proyectado alcanza → siempre rojo
+  // 2. Si cobra en ≤5 días y con ese cobro sobra holgadamente → puede ser verde
+  // 3. Si cobra en ≤5 días pero el margen es justo → amarillo
+  // 4. Si no hay cobro próximo y el saldo no alcanza hoy → rojo
+  // 5. Si el saldo alcanza pero hay deudas de alto interés → amarillo como máximo
   let verdict;
   if (amount === 0) {
     verdict = "neutral";
-  } else if (liqS <= 10 || bal < amount) {
-    // Sin liquidez → siempre rojo sin importar las otras dimensiones
+  } else if (balEfectivo < amount) {
+    // Ni con el cobro proyectado alcanza → rojo siempre
+    verdict = "red";
+  } else if (bal < amount && cobrarPronto) {
+    // No alcanza hoy pero sí con el cobro inminente (≤5 días)
+    // Si el saldo post-cobro-post-compra es holgado → verde
+    // Si es justo → amarillo
+    const pctRestante = balAfterProyectado / balProyectado;
+    verdict = (score >= 65 && debtS >= 50 && pctRestante >= 0.1)
+      ? "green"
+      : "yellow";
+  } else if (liqS <= 10) {
     verdict = "red";
   } else if (score >= 70 && debtS >= 50) {
     verdict = "green";
