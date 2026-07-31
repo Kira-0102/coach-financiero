@@ -1266,8 +1266,12 @@ function buildCoachContext() {
   // P17: datos estructurados para que el modelo razone mejor con hechos, no solo texto
   const structured = {
     perfil: {
-      ingreso_mensual: Math.round(monthlyIncome()),
       frecuencia_cobro: state.profile?.pay_frequency === "biweekly" ? "quincenal" : "mensual",
+      // DISTINCIÓN CRÍTICA: ingreso_por_cobro es lo que entra CADA vez.
+      // ingreso_mensual_total es la suma de TODOS los cobros del mes.
+      // Para usuarios quincenales, el próximo cobro es ingreso_por_cobro, NO ingreso_mensual_total.
+      ingreso_por_cobro: Math.round(monthlyIncome() / (state.profile?.pay_frequency === "biweekly" ? 2 : 1)),
+      ingreso_mensual_total: Math.round(monthlyIncome()),
       saldo_actual: Math.round(bal),
       disponible_restante_este_mes: disponibleRestante,
     },
