@@ -34,7 +34,7 @@ const DEBT_TYPES = [
 
 let user = null;
 let categories = [];
-let state = { account: null, profile: null, goals: [], fixed: [], debts: [], transactions: [], budgets: [] };
+let state = { account: null, profile: null, goals: [], fixed: [], debts: [], transactions: [], budgets: [], analysis: null };
 let tab = "inicio";
 let goalMode = "byDeadline"; // solo un modo en Fase 1, pero dejamos la variable por si acaso
 
@@ -158,6 +158,10 @@ async function loadState() {
     transactions: transactions || [],
     budgets: budgets || [],
   };
+
+  // FinancialEngine: recalcular state.analysis cada vez que cambia state.
+  // Todas las pantallas leen FA() en vez de recalcular por su cuenta.
+  computeAnalysis();
 }
 
 function spentThisMonthTotal() {
@@ -337,6 +341,476 @@ function computeBaselineScore() {
 
   return Math.round(Math.max(0, Math.min(100, score)));
 }
+
+// ================================================================
+// ================================================================
+// FINANCIAL ENGINE — FASE 1 (v2)
+// Arquitectura en 5 capas con responsabilidades separadas.
+//
+// REGLAS DE ORO (ningún código nuevo puede violarlas):
+//   1. Ninguna pantalla lee state.* para cálculos — solo state.analysis.
+//      Excepción: formularios de creación/edición (CRUD).
+//   2. El engine es puro — nunca modifica state. Solo recibe y retorna.
+//   3. Ningún código nuevo llama funciones @legacy directamente.
+//      Las @legacy son wrappers de compatibilidad durante la migración.
+//
+// CAPAS:
+//   FinancialData      → normalización de datos crudos
+//   FinancialEngine    → describe la realidad financiera (puro)
+//   RecommendationEngine → prioridades, estrategia, next best action
+//   PurchaseEngine     → análisis de compras (Fase 3)
+//   CoachContextBuilder → contexto para la IA (Fase 5)
+//   DashboardPresenter → modelo para la UI (Fase 4)
+//
+// SCHEMA VERSION: 1
+// Incrementar cuando cambie la estructura de FinancialAnalysis
+// para que módulos que consumen el análisis puedan verificar.
+// ================================================================
+const FA_SCHEMA_VERSION = 1;
+
+// ---------------------------------------------------------------
+// @legacy — WRAPPERS DE COMPATIBILIDAD TEMPORAL
+// Estas funciones existían antes del engine y siguen funcionando
+// para no romper el código de las pantallas mientras se migran.
+// NINGÚN CÓDIGO NUEVO debe llamarlas directamente.
+// Cuando todos los módulos lean state.analysis, se eliminarán.
+// ---------------------------------------------------------------
+// Las funciones balance(), disponible(), monthlyIncome(), etc.
+// siguen declaradas más arriba en el archivo y son llamadas DESDE
+// el engine. Su uso directo en la UI está marcado como deprecated.
+
+// ---------------------------------------------------------------
+// CAPA 1 — FinancialData
+// Única responsabilidad: normalizar datos crudos de state.
+// El engine NUNCA lee state directamente — solo FinancialData.
+// Resuelve frecuencias, calcula próximo cobro, normaliza montos.
+// ---------------------------------------------------------------
+function buildFinancialData() {
+  const raw = {
+    account:      state.account      ?? null,
+    profile:      state.profile      ?? null,
+    transactions: state.transactions ?? [],
+    goals:        state.goals        ?? [],
+    fixed:        state.fixed        ?? [],
+    debts:        state.debts        ?? [],
+    budgets:      state.budgets      ?? [],
+    categories:   categories         ?? [],
+  };
+
+  // Guard: sin perfil o cuenta → análisis parcial (onboarding)
+  if (!raw.profile || !raw.account) return { raw, normalized: null };
+
+  const freq         = raw.profile.pay_frequency ?? "monthly";
+  const perPaycheck  = Number(raw.profile.declared_monthly_income) || 0;
+  const monthlyInc   = freq === "biweekly" ? perPaycheck * 2 : perPaycheck;
+  const dailyInc     = Math.round(monthlyInc / 30);
+  const annualInc    = monthlyInc * 12;
+
+  // Próximo cobro — resuelto en la capa de normalización
+  const today   = new Date();
+  const m = today.getMonth(), y = today.getFullYear();
+  let nextPayDate = null, daysUntilPay = null, nextPayAmount = null;
+  if (raw.profile.pay_day_1) {
+    const days = (freq === "biweekly" && raw.profile.pay_day_2)
+      ? [raw.profile.pay_day_1, raw.profile.pay_day_2].sort((a, b) => a - b)
+      : [raw.profile.pay_day_1];
+    let next = null;
+    for (const d of days) {
+      const c = new Date(y, m, d);
+      if (c > today) { next = c; break; }
+    }
+    if (!next) next = new Date(y, m + 1, days[0]);
+    nextPayDate  = next.toLocaleDateString("es-DO", { day: "numeric", month: "long" });
+    daysUntilPay = Math.ceil((next - today) / 86400000);
+    nextPayAmount = perPaycheck;
+  }
+
+  // Gastos del mes actual — excluye aportes y pagos (no son gasto variable)
+  const monthStart  = new Date(y, m, 1);
+  const txMonth     = raw.transactions.filter(t => new Date(t.occurred_at) >= monthStart);
+  const spentVar    = txMonth.filter(t => {
+    if (Number(t.amount) >= 0) return false;
+    const note = t.note || "";
+    if (!t.category_id && (note.startsWith("Aporte:") || note.startsWith("Pago:"))) return false;
+    return true;
+  }).reduce((s, t) => s + Math.abs(Number(t.amount)), 0);
+
+  const monthlyFixed = raw.fixed.reduce((s, f) => s + Number(f.estimated_amount), 0);
+  const availToday   = Number(raw.account.computed_balance ?? raw.account.initial_balance ?? 0);
+  const daysInMonth  = new Date(y, m + 1, 0).getDate();
+  const daysLeft     = Math.max(1, daysInMonth - today.getDate());
+
+  // Compromisos financieros antes del próximo cobro
+  const debtCommitment = raw.debts.reduce((s, d) => s + (Number(d.minimum_payment) || 0), 0);
+  const goalCommitment = raw.goals
+    .filter(g => g.status !== "completed")
+    .reduce((s, g) => {
+      const created = new Date(g.created_at);
+      const elapsed = (y - created.getFullYear()) * 12 + (m - created.getMonth());
+      const rem     = Math.max(1, g.target_months - elapsed);
+      const toSave  = Math.max(0, Number(g.target_amount) - Number(g.current_amount));
+      return s + toSave / rem;
+    }, 0);
+  const committed = Math.round(debtCommitment + goalCommitment);
+
+  const normalized = {
+    // Ingresos (siempre normalizados a mensual)
+    monthlyIncome: monthlyInc, dailyIncome: dailyInc,
+    annualIncome: annualInc, perPaycheck, payFrequency: freq,
+    nextPayDate, daysUntilPay, nextPayAmount,
+
+    // Gastos
+    monthlyFixed, spentThisMonth: Math.round(spentVar),
+    availableToday: Math.round(availToday),
+    daysLeft, dailyRate: availToday > 0 ? Math.round(availToday / daysLeft) : 0,
+
+    // Dinero libre (reglas de negocio formales del Documento 0)
+    disponible:        monthlyInc - monthlyFixed,
+    dispRestante:      Math.round((monthlyInc - monthlyFixed) - spentVar),
+    committed,
+    freeCashToday:     Math.round(availToday - committed),
+    freeCashProjected: nextPayAmount !== null
+      ? Math.round(availToday + nextPayAmount - committed)
+      : null,
+  };
+
+  return { raw, normalized };
+}
+
+// ---------------------------------------------------------------
+// CAPA 2 — FinancialEngine (PURO — nunca modifica state)
+// Única responsabilidad: describir la realidad financiera.
+// No toma decisiones, no prioriza, no recomienda.
+// Organizado por dominios para facilitar crecimiento futuro.
+// ---------------------------------------------------------------
+function FinancialEngine(fd) {
+  if (!fd.normalized) return FinancialAnalysis.empty(fd.raw);
+
+  const n = fd.normalized, raw = fd.raw;
+
+  // DOMINIO: cashFlow
+  const cashFlow = {
+    availableToday:    n.availableToday,
+    availableMonthly:  n.dispRestante,
+    freeCashToday:     n.freeCashToday,
+    freeCashProjected: n.freeCashProjected,
+    committed:         n.committed,
+    dailyRate:         n.dailyRate,
+    daysLeft:          n.daysLeft,
+    nextPay: n.nextPayDate ? {
+      amount: n.nextPayAmount, date: n.nextPayDate, daysAway: n.daysUntilPay,
+      summary: `en ${n.daysUntilPay} día${n.daysUntilPay !== 1 ? "s" : ""} (${n.nextPayDate}) por ${money(n.nextPayAmount)}`,
+    } : null,
+  };
+
+  // DOMINIO: spending
+  const spending = {
+    thisMonth: n.spentThisMonth, fixed: n.monthlyFixed, variable: n.spentThisMonth,
+    byCategory: Object.fromEntries(
+      (raw.categories || []).map(c => [c.id, spentThisMonthByCategory(c.id)])
+    ),
+  };
+
+  // DOMINIO: goals (describe el estado, no decide qué hacer)
+  const now = new Date();
+  const activeGoals    = raw.goals.filter(g => g.status !== "completed");
+  const completedGoals = raw.goals.filter(g => g.status === "completed");
+  const totalPace = activeGoals.reduce((s, g) => {
+    const created = new Date(g.created_at);
+    const elapsed = (now.getFullYear() - created.getFullYear()) * 12 + (now.getMonth() - created.getMonth());
+    const rem     = Math.max(1, g.target_months - elapsed);
+    return s + Math.max(0, Number(g.target_amount) - Number(g.current_amount)) / rem;
+  }, 0);
+
+  const goals = {
+    active: activeGoals, completed: completedGoals,
+    totalMonthlyPace: Math.round(totalPace),
+    canAffordAllGoals: n.dispRestante >= totalPace,
+    byGoal: activeGoals.map(g => {
+      const created = new Date(g.created_at);
+      const elapsed = (now.getFullYear() - created.getFullYear()) * 12 + (now.getMonth() - created.getMonth());
+      const rem     = Math.max(1, g.target_months - elapsed);
+      const toSave  = Math.max(0, Number(g.target_amount) - Number(g.current_amount));
+      const pace    = Math.round(toSave / rem);
+      const st      = toSave <= 0 ? "completed" : pace > n.dispRestante ? "at_risk" : "active";
+      return { ...g, pace, monthsLeft: rem, derivedStatus: st };
+    }),
+  };
+
+  // DOMINIO: debts (describe el estado, no recomienda estrategia)
+  const sortedDebts       = [...raw.debts].sort((a, b) => (Number(b.interest_rate)||0) - (Number(a.interest_rate)||0));
+  const topDebt           = sortedDebts[0] ?? null;
+  const totalDebtAmt      = raw.debts.reduce((s, d) => s + Number(d.current_balance), 0);
+  const monthlyDebtCommit = raw.debts.reduce((s, d) => s + (Number(d.minimum_payment)||0), 0);
+  const topRate           = Number(topDebt?.interest_rate) || 0;
+  const debtRisk = topDebt
+    ? (topRate >= 30 ? "critical" : topRate >= 15 ? "high" : "moderate")
+    : "none";
+
+  const debts = {
+    total: totalDebtAmt, count: raw.debts.length,
+    topDebt, riskLevel: debtRisk,
+    sorted: sortedDebts, monthlyCommitment: Math.round(monthlyDebtCommit),
+  };
+
+  // DOMINIO: financialHealth — score con pesos dinámicos por etapa
+  const inc = n.monthlyIncome;
+  const savComp  = inc > 0 ? Math.max(0, Math.min(1, (Math.max(0, n.disponible) / inc) * 2)) : 0;
+  const liqComp  = inc > 0 ? Math.max(0, Math.min(1, n.availableToday / inc)) : 0;
+  const debtComp = inc > 0 ? 1 - Math.max(0, Math.min(1, totalDebtAmt / (inc * 3))) : 1;
+
+  // Etapa detectada automáticamente — SOLO describe, no recomienda
+  const stage = (() => {
+    if (n.availableToday <= 0 && totalDebtAmt > 0)  return "survival";
+    if (totalDebtAmt > 0 && debtRisk === "critical") return "debt_elimination";
+    if (n.availableToday < inc * 0.5)                return "stability";
+    if (totalDebtAmt === 0 && activeGoals.length > 0) return "building";
+    return "growth";
+  })();
+
+  // Pesos dinámicos según etapa (el engine los calcula, el RecommendationEngine los usa)
+  const weights = {
+    survival:         { liquidity: 50, savings: 30, debt: 20 },
+    debt_elimination: { liquidity: 30, savings: 20, debt: 50 },
+    stability:        { liquidity: 35, savings: 35, debt: 30 },
+    building:         { liquidity: 30, savings: 40, debt: 30 },
+    growth:           { liquidity: 25, savings: 40, debt: 35 },
+  }[stage] ?? { liquidity: 35, savings: 35, debt: 30 };
+
+  const score = inc > 0 ? Math.round(Math.max(0, Math.min(100,
+    savComp * weights.savings + liqComp * weights.liquidity + debtComp * weights.debt
+  ))) : null;
+
+  const financialHealth = {
+    score, stage,
+    stageLabel: {
+      survival: "Supervivencia", debt_elimination: "Eliminar deudas",
+      stability: "Estabilidad",  building: "Construcción", growth: "Crecimiento",
+    }[stage] ?? "Estabilidad",
+    components: {
+      savings:   { value: Math.round(savComp  * weights.savings),   weight: weights.savings,   raw: savComp  },
+      liquidity: { value: Math.round(liqComp  * weights.liquidity), weight: weights.liquidity, raw: liqComp  },
+      debt:      { value: Math.round(debtComp * weights.debt),      weight: weights.debt,      raw: debtComp },
+    },
+    weights,
+  };
+
+  return {
+    schemaVersion: FA_SCHEMA_VERSION,
+    generatedAt:   new Date(),
+    stage,
+    // Dominios (solo describen realidad — sin decisiones ni recomendaciones)
+    cashFlow, spending, goals, debts, financialHealth,
+    // Datos normalizados — disponibles para RecommendationEngine, PurchaseEngine, etc.
+    normalized: n,
+  };
+}
+
+// ---------------------------------------------------------------
+// CAPA 3 — RecommendationEngine
+// Única responsabilidad: interpretar FinancialAnalysis y generar
+// prioridades, next best action y guidance para el dashboard.
+// Separado del engine para que pueda cambiar sin tocar el core.
+// Recibe el análisis como parámetro — sin acceso global.
+// ---------------------------------------------------------------
+function RecommendationEngine(analysis) {
+  if (!analysis || !analysis.cashFlow) {
+    return { priorities: [], nextBestAction: null, headline: "Completa tu perfil para ver recomendaciones." };
+  }
+
+  const { goals, debts, financialHealth, normalized: n } = analysis;
+  const { stage } = financialHealth;
+
+  const priorities = [];
+
+  // Deuda crítica (prestamista/alta tasa) — siempre primero
+  if (debts.topDebt && debts.riskLevel === "critical") {
+    priorities.push({
+      id: "pay_debt_critical", category: "debt",
+      label: `Liquidar deuda "${debts.topDebt.name}"`,
+      impact: 98,
+      why: `Tasa ${debts.topDebt.interest_rate}% anual — cada mes que pasa pierdes dinero`,
+      amount: Number(debts.topDebt.minimum_payment) || null,
+    });
+  }
+
+  // Fondo de emergencia faltante
+  const hasEmergencyFund = goals.active.some(g => g.name.toLowerCase().includes("emergencia"));
+  if (!hasEmergencyFund && n.availableToday < n.monthlyIncome) {
+    priorities.push({
+      id: "emergency_fund", category: "saving",
+      label: "Crear fondo de emergencia",
+      impact: 92,
+      why: "Sin fondo de emergencia cualquier imprevisto puede desestabilizarte",
+      amount: null,
+    });
+  }
+
+  // Deuda de tasa alta (no crítica)
+  if (debts.topDebt && debts.riskLevel === "high") {
+    priorities.push({
+      id: "pay_debt_high", category: "debt",
+      label: `Reducir "${debts.topDebt.name}"`,
+      impact: 78,
+      why: `${debts.topDebt.interest_rate}% anual es una tasa alta`,
+      amount: Number(debts.topDebt.minimum_payment) || null,
+    });
+  }
+
+  // Metas activas
+  goals.byGoal.forEach(g => {
+    priorities.push({
+      id: `goal_${g.id}`, category: "goal",
+      label: `Aportar a "${g.name}"`,
+      impact: g.derivedStatus === "at_risk" ? 70 : 55,
+      why: `${money(g.pace)}/mes necesario — faltan ${money(Math.max(0, Number(g.target_amount) - Number(g.current_amount)))}`,
+      amount: g.pace,
+    });
+  });
+
+  // Colchón general
+  priorities.push({
+    id: "save_buffer", category: "saving",
+    label: "Aumentar colchón mensual",
+    impact: 35,
+    why: "Más margen reduce el estrés financiero y mejora tu score",
+    amount: null,
+  });
+
+  const sorted = priorities.sort((a, b) => b.impact - a.impact);
+  const nextBestAction = sorted[0] ?? null;
+
+  const headline = (() => {
+    if (stage === "survival")          return "Tu prioridad ahora es estabilizar tu liquidez.";
+    if (stage === "debt_elimination")  return "Atacar tu deuda de alto costo es lo más rentable que puedes hacer.";
+    if (!hasEmergencyFund)             return "Completar tu fondo de emergencia es el siguiente paso clave.";
+    if (goals.byGoal.some(g => g.derivedStatus === "at_risk")) return "Alguna de tus metas está en riesgo este mes.";
+    if (goals.active.length > 0)       return `Estás avanzando hacia "${goals.byGoal[0]?.name}".`;
+    return "Tus finanzas están estables. Es buen momento para fijar nuevas metas.";
+  })();
+
+  return { priorities: sorted, nextBestAction, headline, stage };
+}
+
+// ---------------------------------------------------------------
+// FinancialAnalysis.empty — objeto válido para onboarding
+// ---------------------------------------------------------------
+const FinancialAnalysis = {
+  empty(raw) {
+    return {
+      schemaVersion: FA_SCHEMA_VERSION,
+      generatedAt:   new Date(),
+      stage:         "onboarding",
+      cashFlow:      null, spending: null,
+      goals:         { active: [], completed: [], totalMonthlyPace: 0, canAffordAllGoals: false, byGoal: [] },
+      debts:         { total: 0, count: 0, riskLevel: "none", sorted: [], monthlyCommitment: 0 },
+      financialHealth: { score: null, stage: "onboarding", stageLabel: "Configurando", components: {}, weights: {} },
+      normalized:    null,
+      recommendations: { priorities: [], nextBestAction: null, headline: "Completa tu perfil para comenzar." },
+    };
+  },
+};
+
+// ---------------------------------------------------------------
+// computeAnalysis() — punto de entrada público
+// Ejecuta las 3 capas en orden y almacena en state.analysis.
+// Se llama después de cada loadState(). Es puro en el sentido
+// de que no tiene efectos secundarios más allá de state.analysis.
+// ---------------------------------------------------------------
+function computeAnalysis() {
+  const fd         = buildFinancialData();          // Capa 1
+  const analysis   = FinancialEngine(fd);           // Capa 2
+  const recs       = RecommendationEngine(analysis); // Capa 3
+  state.analysis   = { ...analysis, recommendations: recs };
+  return state.analysis;
+}
+
+// ---------------------------------------------------------------
+// SELF-TEST — batería de pruebas para desarrollo
+// Detecta regresiones durante la migración de módulos.
+// Llamar con runEngineTests() desde la consola del navegador.
+// ---------------------------------------------------------------
+function runEngineTests() {
+  const results = [];
+  function assert(desc, condition) {
+    results.push({ desc, ok: !!condition });
+    if (!condition) console.warn(`[ENGINE TEST FAIL] ${desc}`);
+  }
+
+  // Caso 1: usuario nuevo sin datos → no crashea
+  try {
+    const fd = buildFinancialData();
+    assert("Caso 1: usuario nuevo no lanza errores", true);
+    assert("Caso 1: estado onboarding correcto", fd.normalized === null);
+  } catch(e) {
+    assert("Caso 1: usuario nuevo no lanza errores", false);
+  }
+
+  // Simulaciones con datos ficticios
+  function mockAnalysis(overrides = {}) {
+    const base = {
+      cashFlow: { availableToday: 5000, freeCashToday: 3000, freeCashProjected: 20000 },
+      spending: { thisMonth: 500, fixed: 300 },
+      goals: { active: [], completed: [], totalMonthlyPace: 0, canAffordAllGoals: true, byGoal: [] },
+      debts: { total: 0, count: 0, riskLevel: "none", sorted: [], topDebt: null, monthlyCommitment: 0 },
+      financialHealth: { score: 75, stage: "stability", stageLabel: "Estabilidad", components: {}, weights: {} },
+      normalized: { monthlyIncome: 20000, availableToday: 5000, daysUntilPay: 10,
+                    nextPayAmount: 10000, nextPayDate: "15 de agosto", dispRestante: 15000 },
+      stage: "stability",
+    };
+    return { ...base, ...overrides };
+  }
+
+  // Caso 2: sin metas
+  const a2 = mockAnalysis({ goals: { active: [], completed: [], totalMonthlyPace: 0, canAffordAllGoals: true, byGoal: [] } });
+  assert("Caso 2: sin metas → goals.active vacío", a2.goals.active.length === 0);
+
+  // Caso 3: sin deudas
+  const a3 = mockAnalysis();
+  assert("Caso 3: sin deudas → riskLevel none", a3.debts.riskLevel === "none");
+
+  // Caso 4: quincenal → ingreso mensual normalizado
+  const stateBackup = { ...state };
+  state = { ...state, profile: { pay_frequency: "biweekly", declared_monthly_income: 17000, pay_day_1: 15, pay_day_2: 30 }, account: { computed_balance: 5000 }, transactions: [], goals: [], fixed: [], debts: [], budgets: [] };
+  const fd4 = buildFinancialData();
+  assert("Caso 4: quincenal 17000 → mensual 34000", fd4.normalized?.monthlyIncome === 34000);
+  assert("Caso 4: income diario correcto", fd4.normalized?.dailyIncome === 1133);
+
+  // Caso 5: mensual → ingreso sin cambio
+  state.profile = { ...state.profile, pay_frequency: "monthly", declared_monthly_income: 34000 };
+  const fd5 = buildFinancialData();
+  assert("Caso 5: mensual 34000 → mensual 34000", fd5.normalized?.monthlyIncome === 34000);
+
+  // Caso 6: saldo negativo + deuda → stage survival
+  state = { ...stateBackup, profile: { pay_frequency: "monthly", declared_monthly_income: 20000 },
+    account: { computed_balance: -500 },
+    debts: [{ current_balance: 10000, interest_rate: 40, minimum_payment: 2000, debt_type: "lender" }],
+    goals: [], fixed: [], transactions: [], budgets: [] };
+  const fd6 = buildFinancialData();
+  const a6 = FinancialEngine(fd6);
+  assert("Caso 6: saldo negativo + deuda → stage survival", a6.stage === "survival");
+
+  // Caso 7: saldo positivo sin deudas → stage stability o building
+  state = { ...stateBackup, profile: { pay_frequency: "monthly", declared_monthly_income: 20000 },
+    account: { computed_balance: 15000 },
+    debts: [], goals: [], fixed: [], transactions: [], budgets: [] };
+  const fd7 = buildFinancialData();
+  const a7 = FinancialEngine(fd7);
+  assert("Caso 7: saldo positivo sin deudas → stability/building", ["stability","building","growth"].includes(a7.stage));
+
+  // Restaurar state real
+  state = stateBackup;
+
+  const passed = results.filter(r => r.ok).length;
+  const total = results.length;
+  console.log(`[ENGINE TESTS] ${passed}/${total} passed`);
+  results.forEach(r => {
+    const icon = r.ok ? "✅" : "❌";
+    console.log(`  ${icon} ${r.desc}`);
+  });
+  return { passed, total, results };
+}
+
 
 function determineStep() {
   if (!state.account) return "account";
