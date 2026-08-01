@@ -81,18 +81,19 @@ function esc(str) {
 
 // Aviso breve arriba de la pantalla, para confirmar que algo se guardó
 // (antes, editar no daba ninguna señal de que había funcionado).
-function showToast(msg) {
+function showToast(msg, isError = false) {
   let toast = document.getElementById("toastMsg");
   if (!toast) {
     toast = document.createElement("div");
     toast.id = "toastMsg";
-    toast.style.cssText = "position:fixed; top:20px; left:50%; transform:translateX(-50%); background:var(--teal); color:white; padding:10px 18px; border-radius:20px; font-size:13px; z-index:999; box-shadow:0 4px 14px rgba(0,0,0,0.18); opacity:0; transition:opacity 0.25s; pointer-events:none;";
+    toast.style.cssText = "position:fixed; top:20px; left:50%; transform:translateX(-50%); color:white; padding:10px 18px; border-radius:20px; font-size:13px; z-index:999; box-shadow:0 4px 14px rgba(0,0,0,0.18); opacity:0; transition:opacity 0.25s, background 0.15s; pointer-events:none;";
     document.body.appendChild(toast);
   }
+  toast.style.background = isError ? "var(--danger-text)" : "var(--teal)";
   toast.textContent = msg;
   toast.style.opacity = "1";
   clearTimeout(toast._t);
-  toast._t = setTimeout(() => { toast.style.opacity = "0"; }, 1400);
+  toast._t = setTimeout(() => { toast.style.opacity = "0"; }, isError ? 2400 : 1400);
 }
 
 // Reemplaza el confirm() nativo del navegador (feo, fuera de estilo)
@@ -1075,12 +1076,12 @@ function renderOnboardingAccount() {
     const balanceVal = document.getElementById("accBalance").value;
     const errEl = document.getElementById("err");
     if (!userName) {
-      errEl.textContent = "Completá tu nombre.";
+      errEl.textContent = "Completa tu nombre.";
       errEl.classList.add("visible");
       return;
     }
     if (!name) {
-      errEl.textContent = "Completá el nombre de la cuenta.";
+      errEl.textContent = "Completa el nombre de la cuenta.";
       errEl.classList.add("visible");
       return;
     }
@@ -1093,7 +1094,7 @@ function renderOnboardingAccount() {
       ? await supabase.from("accounts").update({ name, type: selectedType, initial_balance: balanceNum }).eq("id", existing.id)
       : await supabase.from("accounts").insert({ user_id: user.id, name, type: selectedType, initial_balance: balanceNum });
     if (error) {
-      errEl.textContent = "No se pudo guardar. Intentá de nuevo.";
+      errEl.textContent = "No se pudo guardar. Intenta de nuevo.";
       errEl.classList.add("visible");
       return;
     }
@@ -1154,7 +1155,7 @@ function renderOnboardingIncome() {
       const amount = document.getElementById("incAmount").value;
       const errEl = document.getElementById("err");
       if (!amount) {
-        errEl.textContent = "Completá el monto.";
+        errEl.textContent = "Completa el monto.";
         errEl.classList.add("visible");
         return;
       }
@@ -1162,7 +1163,7 @@ function renderOnboardingIncome() {
         declared_monthly_income: Number(amount), pay_frequency: frequency,
       }).eq("id", user.id);
       if (error) {
-        errEl.textContent = "No se pudo guardar. Intentá de nuevo.";
+        errEl.textContent = "No se pudo guardar. Intenta de nuevo.";
         errEl.classList.add("visible");
         return;
       }
@@ -1231,7 +1232,7 @@ function renderOnboardingFixed() {
       const amount = document.getElementById("fAmount").value;
       const errEl = document.getElementById("err");
       if (!name || !catId || !amount) {
-        errEl.textContent = "Completá el nombre, la categoría y el monto.";
+        errEl.textContent = "Completa el nombre, la categoría y el monto.";
         errEl.classList.add("visible");
         return;
       }
@@ -1239,7 +1240,7 @@ function renderOnboardingFixed() {
         user_id: user.id, name, category_id: catId, estimated_amount: Number(amount),
       });
       if (error) {
-        errEl.textContent = "No se pudo guardar. Intentá de nuevo.";
+        errEl.textContent = "No se pudo guardar. Intenta de nuevo.";
         errEl.classList.add("visible");
         return;
       }
@@ -1263,45 +1264,11 @@ function renderOnboardingFixed() {
 // ONBOARDING — PASO 4: META
 // ---------------------------------------------------------------
 function renderOnboardingGoal() {
-  function renderCard() {
-    const amountVal = document.getElementById("gAmount")?.value || "";
-    const monthsVal = document.getElementById("gMonths")?.value || "";
-    const target = Number(amountVal) || 0;
-    const months = Number(monthsVal) || 0;
-    const monthly = months > 0 ? target / months : 0;
-    const pct = disponible() > 0 && monthly > 0 ? Math.round((monthly / disponible()) * 100) : 0;
-    const sospechosamenteBajo = target > 0 && totalFixed() > 0 && target < totalFixed();
-
-    const cardEl = document.getElementById("goalViabilityCard");
-    if (!cardEl) return;
-
-    if (target <= 0 || months <= 0) {
-      cardEl.innerHTML = `<div class="card" style="text-align:center;"><p style="font-size:12px; color:var(--text-muted); margin:0;">Completá los campos para ver si es alcanzable</p></div>`;
-      return;
-    }
-
-    cardEl.innerHTML = `
-      <div class="card ${pct <= 40 ? "success" : "warning"}">
-        <p style="font-size:12px; margin:0; color:${pct <= 40 ? "var(--success-text)" : "var(--warning-text)"};">
-          ${pct <= 40 ? "✓ Esta meta parece alcanzable." : "⚠ Puede ser difícil de sostener."}
-          ${money(monthly)}/mes — un ${pct}% de tu disponible.
-        </p>
-      </div>
-      ${sospechosamenteBajo ? `
-        <div class="card warning" style="margin-top:8px;">
-          <p style="font-size:12px; margin:0; color:var(--warning-text);">
-            ⚠ ${money(target)} es menos que un mes de tus gastos fijos (${money(totalFixed())}). Si es tu fondo de emergencia, revisa que no te haya faltado un cero.
-          </p>
-        </div>
-      ` : ""}
-    `;
-  }
-
   function paint() {
     root.innerHTML = `
       <div class="screen">
         <p class="step-label">Paso 4 de 4</p>
-        <h1>Creá tu primera meta</h1>
+        <h1>Crea tu primera meta</h1>
 
         <label>¿Cómo la llamamos?</label>
         <input id="gName" placeholder="Ej. Fondo de emergencia" style="margin-bottom:12px;" />
@@ -1309,12 +1276,20 @@ function renderOnboardingGoal() {
         <label>Monto objetivo</label>
         <input id="gAmount" type="number" step="1" min="0" placeholder="RD$0" style="margin-bottom:12px;" />
 
-        <label>¿En cuántos meses?</label>
-        <input id="gMonths" type="number" step="1" min="0" placeholder="Ej. 6" style="margin-bottom:12px;" />
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:4px;">
+          <div>
+            <label style="font-size:11px;">¿En cuántos meses?</label>
+            <input id="gMonths" type="number" step="1" min="0" placeholder="Ej. 6" style="margin-bottom:0;" />
+          </div>
+          <div>
+            <label style="font-size:11px;">¿Cuánto puedes dar/mes? <span style="color:var(--text-muted);">(opcional)</span></label>
+            <input id="gMonthly" type="number" step="1" min="0" placeholder="RD$0" style="margin-bottom:0;" />
+          </div>
+        </div>
 
         <div class="error-banner" id="err"></div>
 
-        <div id="goalViabilityCard"></div>
+        <div id="goalViabilityCard" style="margin-top:8px;"></div>
 
         <div class="btn-row" style="margin-top:16px;">
           <button class="btn-back" id="backBtn">‹</button>
@@ -1323,28 +1298,65 @@ function renderOnboardingGoal() {
       </div>
     `;
 
+    function renderCard() {
+      const amount = Number(document.getElementById("gAmount")?.value) || 0;
+      const months = Number(document.getElementById("gMonths")?.value) || 0;
+      const monthly = Number(document.getElementById("gMonthly")?.value) || 0;
+      const cardEl = document.getElementById("goalViabilityCard");
+      if (!cardEl) return;
+
+      if (amount <= 0 || (months <= 0 && monthly <= 0)) {
+        cardEl.innerHTML = `<div class="card" style="text-align:center;"><p style="font-size:12px; color:var(--text-muted); margin:0;">Completa el monto y el plazo (o cuánto puedes dar por mes) para ver si es alcanzable</p></div>`;
+        return;
+      }
+
+      cardEl.innerHTML = buildGoalPreviewHTML(amount, months, monthly);
+
+      const sospechosamenteBajo = amount > 0 && totalFixed() > 0 && amount < totalFixed();
+      if (sospechosamenteBajo) {
+        cardEl.innerHTML += `
+          <div class="card warning" style="margin-top:8px;">
+            <p style="font-size:12px; margin:0; color:var(--warning-text);">
+              ⚠ ${money(amount)} es menos que un mes de tus gastos fijos (${money(totalFixed())}). Si es tu fondo de emergencia, revisa que no te haya faltado un cero.
+            </p>
+          </div>`;
+      }
+    }
+
     renderCard();
     document.getElementById("gAmount").addEventListener("input", renderCard);
     document.getElementById("gMonths").addEventListener("input", renderCard);
+    document.getElementById("gMonthly").addEventListener("input", renderCard);
 
     document.getElementById("backBtn").addEventListener("click", () => renderOnboardingFixed());
 
     document.getElementById("finishBtn").addEventListener("click", async () => {
       const name = document.getElementById("gName").value.trim();
-      const target = Number(document.getElementById("gAmount").value) || 0;
+      const amount = Number(document.getElementById("gAmount").value) || 0;
       const months = Number(document.getElementById("gMonths").value) || 0;
+      const monthly = Number(document.getElementById("gMonthly").value) || 0;
       const errEl = document.getElementById("err");
-      if (!name || target <= 0 || months <= 0) {
-        errEl.textContent = "Completá todos los campos.";
+
+      if (!name || amount <= 0) {
+        errEl.textContent = "Completa el nombre y el monto objetivo.";
         errEl.classList.add("visible");
         return;
       }
+      if (months <= 0 && monthly <= 0) {
+        errEl.textContent = "Pon el plazo en meses o cuánto puedes dar por mes.";
+        errEl.classList.add("visible");
+        return;
+      }
+
+      // Si solo puso aporte mensual, calcula el plazo — misma lógica que "+ Nueva meta".
+      const targetMonths = months > 0 ? months : Math.ceil(amount / monthly);
+
       const { error } = await supabase.from("goals").insert({
-        user_id: user.id, name, target_amount: target, target_months: months,
+        user_id: user.id, name, target_amount: amount, target_months: targetMonths,
         linked_account_id: state.account.id, priority: "critical",
       });
       if (error) {
-        errEl.textContent = "No se pudo guardar. Intentá de nuevo.";
+        errEl.textContent = "No se pudo guardar. Intenta de nuevo.";
         errEl.classList.add("visible");
         return;
       }
@@ -2253,6 +2265,8 @@ function tplInicio() {
   const g = primaryGoal();
   const progressPct = g ? Math.min(100, Math.round((Number(g.current_amount) / Number(g.target_amount)) * 100)) : 0;
   const baseline = state.analysis?.financialHealth?.score ?? null;
+  // Regla de oro: las pantallas leen de state.analysis, no de funciones legacy.
+  const bal = state.analysis?.cashFlow?.availableToday ?? balance();
   return `
     <div class="top-bar">
       <div>
@@ -2266,7 +2280,7 @@ function tplInicio() {
       <div class="score-box">
         <p class="label">Situación</p>
         <p class="value" style="color:var(--teal);">${baseline !== null ? baseline : "—"}</p>
-        <p style="font-size:10px; color:var(--text-muted); margin:4px 0 0;">${balance() <= 0 ? "Estimado — carga tu saldo para afinarlo" : "Según tu ingreso, deuda y ahorro"}</p>
+        <p style="font-size:10px; color:var(--text-muted); margin:4px 0 0;">${bal <= 0 ? "Estimado — carga tu saldo para afinarlo" : "Según tu ingreso, deuda y ahorro"}</p>
       </div>
       <div class="score-box">
         <p class="label">Hábitos</p>
@@ -2275,11 +2289,11 @@ function tplInicio() {
       </div>
     </div>
 
-    <div class="card row-between" id="cardSaldo" style="margin-bottom:10px; cursor:pointer; ${balance() < 0 ? 'background:var(--danger-bg);' : ''}">
-      <span style="font-size:12px; color:${balance() < 0 ? 'var(--danger-text)' : 'var(--text-secondary)'};">
-        ${balance() < 0 ? '⚠ Saldo en negativo' : 'Saldo en cuenta'}
+    <div class="card row-between" id="cardSaldo" style="margin-bottom:10px; cursor:pointer; ${bal < 0 ? 'background:var(--danger-bg);' : ''}">
+      <span style="font-size:12px; color:${bal < 0 ? 'var(--danger-text)' : 'var(--text-secondary)'};">
+        ${bal < 0 ? '⚠ Saldo en negativo' : 'Saldo en cuenta'}
       </span>
-      <span style="font-weight:600; color:${balance() < 0 ? 'var(--danger-text)' : 'var(--teal)'};">${money(balance())} ›</span>
+      <span style="font-weight:600; color:${bal < 0 ? 'var(--danger-text)' : 'var(--teal)'};">${money(bal)} ›</span>
     </div>
 
     ${g ? `
@@ -2771,11 +2785,11 @@ function wireTabEvents() {
     const name = document.getElementById("newFName").value.trim();
     const catId = document.getElementById("newFCat").value;
     const amount = document.getElementById("newFAmount").value;
-    if (!name || !catId || !amount) { alert("Completá el nombre, la categoría y el monto."); return; }
+    if (!name || !catId || !amount) { showToast("Completa el nombre, la categoría y el monto.", true); return; }
     const { error } = await supabase.from("recurring_expense_templates").insert({
       user_id: user.id, name, category_id: catId, estimated_amount: Number(amount),
     });
-    if (error) { alert("No se pudo guardar. Intentá de nuevo."); return; }
+    if (error) { showToast("No se pudo guardar. Intenta de nuevo.", true); return; }
     await loadState(); renderApp();
   });
 
@@ -2811,14 +2825,14 @@ function wireTabEvents() {
       const oldBudgetId = btn.dataset.updateBudget;
       const input = document.getElementById(`budgetEditInput-${catId}`);
       const amount = input.value;
-      if (!amount || Number(amount) <= 0) { alert("Poné un monto válido."); return; }
+      if (!amount || Number(amount) <= 0) { showToast("Pon un monto válido.", true); return; }
       const today = new Date().toISOString().slice(0, 10);
       const { error: closeError } = await supabase.from("budgets").update({ effective_to: today }).eq("id", oldBudgetId);
-      if (closeError) { alert("No se pudo actualizar. Intentá de nuevo."); return; }
+      if (closeError) { showToast("No se pudo actualizar. Intenta de nuevo.", true); return; }
       const { error: insertError } = await supabase.from("budgets").insert({
         user_id: user.id, category_id: catId, amount: Number(amount), effective_from: today,
       });
-      if (insertError) { alert("No se pudo actualizar. Intentá de nuevo."); return; }
+      if (insertError) { showToast("No se pudo actualizar. Intenta de nuevo.", true); return; }
       await loadState(); renderApp();
     });
   });
@@ -2853,7 +2867,7 @@ function wireTabEvents() {
       const amount = Number(input.value);
       if (amount > 0) toSave.push({ catId: input.dataset.cat, amount });
     });
-    if (toSave.length === 0) { alert("Escribe al menos un monto para guardar."); return; }
+    if (toSave.length === 0) { showToast("Escribe al menos un monto para guardar.", true); return; }
     saveAllBudgetsBtn.disabled = true;
     saveAllBudgetsBtn.textContent = "Guardando…";
     const today = new Date().toISOString().slice(0, 10);
@@ -2865,27 +2879,13 @@ function wireTabEvents() {
     const results = await Promise.all(inserts);
     const failed = results.filter(r => r.error);
     if (failed.length > 0) {
-      alert(`${failed.length} presupuesto(s) no se pudieron guardar. Intenta de nuevo.`);
+      showToast(`${failed.length} presupuesto(s) no se pudieron guardar. Intenta de nuevo.`, true);
       saveAllBudgetsBtn.disabled = false;
       saveAllBudgetsBtn.textContent = "Guardar presupuestos";
       return;
     }
     await loadState(); renderApp();
     showToast(`${toSave.length} presupuesto${toSave.length > 1 ? "s" : ""} guardado${toSave.length > 1 ? "s" : ""}`);
-  });
-
-  document.querySelectorAll("[data-set-budget]").forEach(btn => {
-    btn.addEventListener("click", async () => {
-      const catId = btn.dataset.setBudget;
-      const input = document.getElementById(`budgetInput-${catId}`);
-      const amount = input.value;
-      if (!amount || Number(amount) <= 0) { alert("Poné un monto válido."); return; }
-      const { error } = await supabase.from("budgets").insert({
-        user_id: user.id, category_id: catId, amount: Number(amount), effective_from: new Date().toISOString().slice(0, 10),
-      });
-      if (error) { alert("No se pudo guardar. Intentá de nuevo."); return; }
-      await loadState(); renderApp();
-    });
   });
 
   document.querySelectorAll("[data-remove-budget]").forEach(btn => {
@@ -2903,8 +2903,8 @@ function wireTabEvents() {
     const amount = document.getElementById("newDAmount").value;
     const interest = document.getElementById("newDInterest").value;
     const installments = document.getElementById("newDInstallments").value;
-    if (!name || !debtType || !amount) { alert("Completá el nombre, el tipo y el monto."); return; }
-    if (interest && Number(interest) < 0) { alert("La tasa de interés no puede ser negativa."); return; }
+    if (!name || !debtType || !amount) { showToast("Completa el nombre, el tipo y el monto.", true); return; }
+    if (interest && Number(interest) < 0) { showToast("La tasa de interés no puede ser negativa.", true); return; }
     const minimumPayment = installments && Number(installments) > 0
       ? Math.round(calcPMT(Number(amount), Number(interest) || 0, Number(installments)))
       : null;
@@ -2914,7 +2914,7 @@ function wireTabEvents() {
       interest_rate: interest ? Number(interest) : null,
       minimum_payment: minimumPayment,
     });
-    if (error) { alert("No se pudo guardar. Intentá de nuevo."); return; }
+    if (error) { showToast("No se pudo guardar. Intenta de nuevo.", true); return; }
     await loadState(); renderApp();
   });
 
@@ -2953,8 +2953,8 @@ function openEditDebtModal(debtId) {
     const name = document.getElementById("edName").value.trim();
     const debtType = document.getElementById("edType").value;
     const interest = document.getElementById("edInterest").value;
-    if (!name) { alert("El nombre no puede quedar vacío."); return; }
-    if (interest && Number(interest) < 0) { alert("La tasa de interés no puede ser negativa."); return; }
+    if (!name) { showToast("El nombre no puede quedar vacío.", true); return; }
+    if (interest && Number(interest) < 0) { showToast("La tasa de interés no puede ser negativa.", true); return; }
     const saveBtn = document.getElementById("saveEditDebt");
     saveBtn.disabled = true;
     saveBtn.textContent = "Guardando…";
@@ -2962,7 +2962,7 @@ function openEditDebtModal(debtId) {
       name, debt_type: debtType, interest_rate: interest ? Number(interest) : null,
     }).eq("id", debtId);
     if (error) {
-      alert("No se pudo guardar. Intentá de nuevo.");
+      showToast("No se pudo guardar. Intenta de nuevo.", true);
       saveBtn.disabled = false;
       saveBtn.textContent = "Guardar";
       return;
@@ -3002,7 +3002,7 @@ function openEditFixedModal(fixedId) {
     const name = document.getElementById("efName").value.trim();
     const catId = document.getElementById("efCat").value;
     const amount = document.getElementById("efAmount").value;
-    if (!name || !amount) { alert("Completá el nombre y el monto."); return; }
+    if (!name || !amount) { showToast("Completa el nombre y el monto.", true); return; }
     const saveBtn = document.getElementById("saveEditFixed");
     saveBtn.disabled = true;
     saveBtn.textContent = "Guardando…";
@@ -3010,7 +3010,7 @@ function openEditFixedModal(fixedId) {
       name, category_id: catId, estimated_amount: Number(amount),
     }).eq("id", fixedId);
     if (error) {
-      alert("No se pudo guardar. Intentá de nuevo.");
+      showToast("No se pudo guardar. Intenta de nuevo.", true);
       saveBtn.disabled = false;
       saveBtn.textContent = "Guardar";
       return;
@@ -3055,11 +3055,11 @@ function openEditTxModal(txId) {
     document.getElementById("cancelEditTx").addEventListener("click", () => { modal.classList.remove("visible"); modal.innerHTML = ""; });
     document.getElementById("saveEditTx").addEventListener("click", async () => {
       const amount = document.getElementById("etAmount").value;
-      if (!amount || !selectedCat) { alert("Completá el monto y la categoría."); return; }
+      if (!amount || !selectedCat) { showToast("Completa el monto y la categoría.", true); return; }
       const { error } = await supabase.from("transactions").update({
         amount: -Math.abs(Number(amount)), category_id: selectedCat,
       }).eq("id", txId);
-      if (error) { alert("No se pudo guardar. Intentá de nuevo."); return; }
+      if (error) { showToast("No se pudo guardar. Intenta de nuevo.", true); return; }
       modal.classList.remove("visible"); modal.innerHTML = "";
       await loadState(); renderApp();
       showToast("Gasto actualizado");
@@ -3115,7 +3115,7 @@ function openPayDebtModal(debtId) {
     const amount = Number(document.getElementById("payAmount").value);
     const errEl = document.getElementById("payErr");
     if (!amount || amount <= 0) {
-      errEl.textContent = "Poné un monto válido.";
+      errEl.textContent = "Pon un monto válido.";
       errEl.classList.add("visible");
       return;
     }
@@ -3133,7 +3133,7 @@ function openPayDebtModal(debtId) {
       amount: -Math.abs(amount), note: `Pago: ${d.name}`,
     }).select().single();
     if (txError) {
-      errEl.textContent = "No se pudo registrar el pago. Intentá de nuevo.";
+      errEl.textContent = "No se pudo registrar el pago. Intenta de nuevo.";
       errEl.classList.add("visible");
       return;
     }
@@ -3142,7 +3142,7 @@ function openPayDebtModal(debtId) {
       debt_id: d.id, amount, balance_after: newBalance, transaction_id: txData.id,
     });
     if (payError) {
-      errEl.textContent = "No se pudo registrar el pago. Intentá de nuevo.";
+      errEl.textContent = "No se pudo registrar el pago. Intenta de nuevo.";
       errEl.classList.add("visible");
       return;
     }
@@ -3307,6 +3307,49 @@ function openGoalCelebrationModal(goalName, monthsEarly, monthlyFreed, nextGoal)
 // ---------------------------------------------------------------
 // MODAL: NUEVA META (con selector de prioridad)
 // ---------------------------------------------------------------
+// Preview de viabilidad de meta — compartida entre el onboarding (paso 4)
+// y "+ Nueva meta", para que ambas pantallas calculen exactamente lo mismo
+// y no se desincronicen si una se actualiza y la otra no.
+function buildGoalPreviewHTML(amount, months, monthly) {
+  if (!amount) return "";
+
+  if (monthly > 0 && months <= 0) {
+    const mesesNecesarios = Math.ceil(amount / monthly);
+    const pct = Math.round((monthly / disponible()) * 100);
+    const color = pct > 50 ? "var(--warning-text)" : "var(--success-text)";
+    const bg = pct > 50 ? "var(--warning-bg)" : "var(--success-bg)";
+    return `<div class="card" style="background:${bg}; margin-top:4px;">
+      <p style="font-size:12px; color:${color}; margin:0; line-height:1.5;">
+        Con RD$${money(monthly).replace("RD$","")}/mes llegas en <strong>${mesesNecesarios} meses</strong> — ${pct}% de tu disponible.
+      </p></div>`;
+  } else if (months > 0) {
+    const sugerido = Math.round(amount / months);
+    if (monthly > 0 && monthly < sugerido) {
+      const mesesReales = Math.ceil(amount / monthly);
+      return `<div class="card" style="background:var(--warning-bg); margin-top:4px;">
+        <p style="font-size:12px; color:var(--warning-text); margin:0; line-height:1.5;">
+          Con RD$${money(monthly).replace("RD$","")}/mes llegarás en <strong>${mesesReales} meses</strong>, no en ${months}. Para cumplirlo en ${months} meses necesitas <strong>${money(sugerido)}/mes</strong>.
+        </p></div>`;
+    } else if (monthly >= sugerido) {
+      return `<div class="card" style="background:var(--success-bg); margin-top:4px;">
+        <p style="font-size:12px; color:var(--success-text); margin:0;">
+          ✓ Con ese aporte llegas antes del plazo. Aporte mínimo necesario: ${money(sugerido)}/mes.
+        </p></div>`;
+    } else {
+      const disp = disponible();
+      const pct = disp > 0 ? Math.round((sugerido / disp) * 100) : null;
+      const color = pct === null || pct > 50 ? "var(--warning-text)" : "var(--success-text)";
+      const bg = pct === null || pct > 50 ? "var(--warning-bg)" : "var(--success-bg)";
+      const pctText = pct !== null ? ` — ${pct}% de tu disponible` : "";
+      return `<div class="card" style="background:${bg}; margin-top:4px;">
+        <p style="font-size:12px; color:${color}; margin:0;">
+          ${pct !== null && pct <= 50 ? "✓ Alcanzable." : "⚠ Puede ser difícil."} Necesitas ${money(sugerido)}/mes${pctText}.
+        </p></div>`;
+    }
+  }
+  return "";
+}
+
 function openNewGoalModal() {
   const modal = document.getElementById("logModal");
   modal.classList.add("visible");
@@ -3347,48 +3390,7 @@ function openNewGoalModal() {
     const amount = Number(document.getElementById("ngAmount").value) || 0;
     const months = Number(document.getElementById("ngMonths").value) || 0;
     const monthly = Number(document.getElementById("ngMonthly").value) || 0;
-    const preview = document.getElementById("ngPreview");
-    if (!amount) { preview.innerHTML = ""; return; }
-
-    if (monthly > 0 && months <= 0) {
-      // Solo puso aporte — calcula el plazo
-      const mesesNecesarios = Math.ceil(amount / monthly);
-      const pct = Math.round((monthly / disponible()) * 100);
-      const color = pct > 50 ? "var(--warning-text)" : "var(--success-text)";
-      const bg = pct > 50 ? "var(--warning-bg)" : "var(--success-bg)";
-      preview.innerHTML = `<div class="card" style="background:${bg}; margin-top:4px;">
-        <p style="font-size:12px; color:${color}; margin:0; line-height:1.5;">
-          Con RD$${money(monthly).replace("RD$","")}/mes llegas en <strong>${mesesNecesarios} meses</strong> — ${pct}% de tu disponible.
-        </p></div>`;
-    } else if (months > 0) {
-      // Tiene plazo — calcula el aporte sugerido y compara con el que puso
-      const sugerido = Math.round(amount / months);
-      if (monthly > 0 && monthly < sugerido) {
-        const mesesReales = Math.ceil(amount / monthly);
-        preview.innerHTML = `<div class="card" style="background:var(--warning-bg); margin-top:4px;">
-          <p style="font-size:12px; color:var(--warning-text); margin:0; line-height:1.5;">
-            Con RD$${money(monthly).replace("RD$","")}/mes llegarás en <strong>${mesesReales} meses</strong>, no en ${months}. Para cumplirlo en ${months} meses necesitas <strong>${money(sugerido)}/mes</strong>.
-          </p></div>`;
-      } else if (monthly >= sugerido) {
-        preview.innerHTML = `<div class="card" style="background:var(--success-bg); margin-top:4px;">
-          <p style="font-size:12px; color:var(--success-text); margin:0;">
-            ✓ Con ese aporte llegas antes del plazo. Aporte mínimo necesario: ${money(sugerido)}/mes.
-          </p></div>`;
-      } else {
-        // Solo plazo, sin aporte manual
-        const disp = disponible();
-        const pct = disp > 0 ? Math.round((sugerido / disp) * 100) : null;
-        const color = pct === null || pct > 50 ? "var(--warning-text)" : "var(--success-text)";
-        const bg = pct === null || pct > 50 ? "var(--warning-bg)" : "var(--success-bg)";
-        const pctText = pct !== null ? ` — ${pct}% de tu disponible` : "";
-        preview.innerHTML = `<div class="card" style="background:${bg}; margin-top:4px;">
-          <p style="font-size:12px; color:${color}; margin:0;">
-            ${pct !== null && pct <= 50 ? "✓ Alcanzable." : "⚠ Puede ser difícil."} Necesitas ${money(sugerido)}/mes${pctText}.
-          </p></div>`;
-      }
-    } else {
-      preview.innerHTML = "";
-    }
+    document.getElementById("ngPreview").innerHTML = buildGoalPreviewHTML(amount, months, monthly);
   }
 
   ["ngAmount", "ngMonths", "ngMonthly"].forEach(id => {
@@ -3468,7 +3470,7 @@ function openContributeModal(goalId) {
     const amount = Number(document.getElementById("contribAmount").value);
     const errEl = document.getElementById("contribErr");
     if (!amount || amount <= 0) {
-      errEl.textContent = "Poné un monto válido.";
+      errEl.textContent = "Pon un monto válido.";
       errEl.classList.add("visible");
       return;
     }
@@ -3490,7 +3492,7 @@ function openContributeModal(goalId) {
       amount: -Math.abs(amount), note: `Aporte: ${g.name}`,
     }).select().single();
     if (txError) {
-      errEl.textContent = "No se pudo registrar. Intentá de nuevo.";
+      errEl.textContent = "No se pudo registrar. Intenta de nuevo.";
       errEl.classList.add("visible");
       saveBtn.disabled = false; saveBtn.textContent = "Aportar";
       return;
@@ -3560,14 +3562,14 @@ function openEditGoalModal(goalId) {
     const amount = Number(document.getElementById("egAmount").value);
     const months = Number(document.getElementById("egMonths").value);
     const priority = document.getElementById("egPriority").value;
-    if (!name || amount <= 0 || months <= 0) { alert("El monto y el plazo tienen que ser mayores a cero."); return; }
+    if (!name || amount <= 0 || months <= 0) { showToast("El monto y el plazo tienen que ser mayores a cero.", true); return; }
     const saveBtn = document.getElementById("saveEdit");
     saveBtn.disabled = true;
     saveBtn.textContent = "Guardando…";
     const { error } = await supabase.from("goals").update({ name, target_amount: amount, target_months: months, priority }).eq("id", goalId);
     if (error) {
       const errEl = document.getElementById("egErr");
-      errEl.textContent = "No se pudo guardar. Intentá de nuevo.";
+      errEl.textContent = "No se pudo guardar. Intenta de nuevo.";
       errEl.classList.add("visible");
       saveBtn.disabled = false;
       saveBtn.textContent = "Guardar";
@@ -3613,7 +3615,7 @@ function openIncomeModal() {
     document.getElementById("saveIncLog").addEventListener("click", async () => {
       const amount = document.getElementById("incLogAmount").value;
       const note = document.getElementById("incLogNote").value.trim();
-      if (!amount || Number(amount) <= 0) { alert("Poné un monto válido."); return; }
+      if (!amount || Number(amount) <= 0) { showToast("Pon un monto válido.", true); return; }
       const saveBtn = document.getElementById("saveIncLog");
       saveBtn.disabled = true;
       saveBtn.textContent = "Guardando…";
@@ -3622,7 +3624,7 @@ function openIncomeModal() {
         amount: Math.abs(Number(amount)), note: note || null,
       });
       if (error) {
-        alert("No se pudo guardar. Intentá de nuevo.");
+        showToast("No se pudo guardar. Intenta de nuevo.", true);
         saveBtn.disabled = false;
         saveBtn.textContent = "Guardar";
         return;
@@ -3681,7 +3683,7 @@ function openLogModal(prefillAmount = null, prefillNote = null) {
     document.getElementById("cancelLog").addEventListener("click", () => { modal.classList.remove("visible"); modal.innerHTML = ""; });
     document.getElementById("saveLog").addEventListener("click", async () => {
       const amount = document.getElementById("logAmount").value;
-      if (!amount || Number(amount) <= 0 || !selectedCat) { alert("Completá el monto y la categoría."); return; }
+      if (!amount || Number(amount) <= 0 || !selectedCat) { showToast("Completa el monto y la categoría.", true); return; }
       const saveBtn = document.getElementById("saveLog");
       saveBtn.disabled = true;
       saveBtn.textContent = "Guardando…";
@@ -3690,7 +3692,7 @@ function openLogModal(prefillAmount = null, prefillNote = null) {
         amount: -Math.abs(Number(amount)),
       });
       if (error) {
-        alert("No se pudo guardar. Intentá de nuevo.");
+        showToast("No se pudo guardar. Intenta de nuevo.", true);
         saveBtn.disabled = false;
         saveBtn.textContent = "Guardar";
         return;
