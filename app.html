@@ -17,6 +17,10 @@
 <script type="module">
 import { supabase } from "./js/supabaseClient.js";
 
+const APP_BUILD = "financial-core-v2-audit-2026-08-01";
+window.__APP_BUILD__ = APP_BUILD;
+console.info(`[Coach Financiero] build ${APP_BUILD}`);
+
 const CATEGORY_ICONS = {
   Comida: "🍽️", Transporte: "🚌", Vivienda: "🏠", Salud: "💊",
   Ocio: "🎮", Educación: "🎓", Ropa: "👕", Otro: "•",
@@ -34,7 +38,10 @@ const DEBT_TYPES = [
 
 let user = null;
 let categories = [];
-let state = { account: null, profile: null, goals: [], fixed: [], debts: [], transactions: [], budgets: [], analysis: null };
+let state = {
+  account: null, profile: null, goals: [], fixed: [], debts: [],
+  transactions: [], analysisTransactions: [], budgets: [], analysis: null,
+};
 let tab = "inicio";
 let goalMode = "byDeadline"; // solo un modo en Fase 1, pero dejamos la variable por si acaso
 
@@ -136,48 +143,39 @@ async function init() {
 }
 
 async function loadState() {
-  const [{ data: accounts }, { data: profile }, { data: goals }, { data: fixed }, { data: debts }, { data: transactions }, { data: budgets }] =
-    await Promise.all([
-      supabase.from("accounts").select("*").order("created_at").limit(1),
-      supabase.from("profiles").select("*").eq("id", user.id).single(),
-      supabase.from("goals").select("*").order("created_at"),
-      supabase.from("recurring_expense_templates").select("*, categories(name)").eq("active", true).order("created_at"),
-      supabase.from("debts").select("*").order("created_at"),
-      // P8: el saldo real viene de accounts.computed_balance (trigger de BD).
-      // Limitamos transacciones a 150 para la UI — suficiente para historial reciente.
-      supabase.from("transactions").select("*, categories(name)").order("occurred_at", { ascending: false }).limit(150),
-      supabase.from("budgets").select("*, categories(name)").is("effective_to", null),
-    ]);
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+
+  const results = await Promise.all([
+    supabase.from("accounts").select("*").order("created_at").limit(1),
+    supabase.from("profiles").select("*").eq("id", user.id).single(),
+    supabase.from("goals").select("*").order("created_at"),
+    supabase.from("recurring_expense_templates").select("*, categories(name)").eq("active", true).order("created_at"),
+    supabase.from("debts").select("*").order("created_at"),
+    // Historial reciente para la interfaz.
+    supabase.from("transactions").select("*, categories(name)").order("occurred_at", { ascending: false }).limit(150),
+    // Todas las transacciones del mes para los cálculos financieros.
+    supabase.from("transactions").select("*, categories(name)").gte("occurred_at", monthStart).order("occurred_at", { ascending: false }),
+    supabase.from("budgets").select("*, categories(name)").is("effective_to", null),
+  ]);
+
+  const firstError = results.find(result => result.error)?.error;
+  if (firstError) throw firstError;
+
+  const [accountsResult, profileResult, goalsResult, fixedResult, debtsResult, transactionsResult, monthTransactionsResult, budgetsResult] = results;
 
   state = {
-    account: accounts && accounts[0] ? accounts[0] : null,
-    profile: profile || null,
-    goals: goals || [],
-    fixed: fixed || [],
-    debts: debts || [],
-    transactions: transactions || [],
-    budgets: budgets || [],
+    account: accountsResult.data?.[0] || null,
+    profile: profileResult.data || null,
+    goals: goalsResult.data || [],
+    fixed: fixedResult.data || [],
+    debts: debtsResult.data || [],
+    transactions: transactionsResult.data || [],
+    analysisTransactions: monthTransactionsResult.data || [],
+    budgets: budgetsResult.data || [],
   };
 
-  // FinancialCore: recalcular state.analysis cada vez que cambia state.
-  // Todas las pantallas leen FA() en vez de recalcular por su cuenta.
   computeAnalysis();
-}
-
-function spentThisMonthTotal() {
-  const now = new Date();
-  const start = new Date(now.getFullYear(), now.getMonth(), 1);
-  return state.transactions
-    .filter(t => {
-      if (new Date(t.occurred_at) < start) return false;
-      if (Number(t.amount) >= 0) return false; // ingresos no cuentan
-      // Los aportes a metas y pagos de deuda son transferencias de ahorro,
-      // no gastos variables. Se excluyen para no restar dos veces el ahorro.
-      const note = t.note || "";
-      if (!t.category_id && (note.startsWith("Aporte:") || note.startsWith("Pago:"))) return false;
-      return true;
-    })
-    .reduce((s, t) => s + Math.abs(Number(t.amount)), 0);
 }
 
 // Ritmo REAL necesario para cumplir la meta: usa lo que falta ahorrar
@@ -229,69 +227,39 @@ function goalMonthsEarly(g) {
   return Math.max(0, g.target_months - monthsUsed);
 }
 
-function totalGoalMonthlyPace() {
-  // Solo metas activas — las completadas ya no necesitan aportes.
-  return state.goals
-    .filter(g => g.status !== "completed")
-    .reduce((sum, g) => sum + goalMonthlyPace(g), 0);
-}
-
 // P6: deriva el estado visible de una meta. 'completed' si ya llegó;
 // 'at_risk' si el ritmo requerido supera holgadamente lo disponible.
 function goalStatus(g) {
-  // P3: respetar el status guardado en la BD para metas completadas.
-  // Solo recalcular active/at_risk para las que aún están en curso.
+  if (!g) return "active";
   if (g.status === "completed" || Number(g.current_amount) >= Number(g.target_amount)) return "completed";
-  const pace = goalMonthlyPace(g);
-  // P11: usar disponible restante real (ingreso - fijos - gastos variables del mes).
-  // Los aportes a metas ya están excluidos de spentThisMonthTotal(), así que no
-  // se resta dos veces el dinero destinado al ahorro.
-  const dispRestante = disponible() - spentThisMonthTotal();
-  if (dispRestante > 0 && pace > dispRestante) return "at_risk";
-  return "active";
+  if (g.status === "paused" || g.status === "abandoned") return g.status;
+
+  const analyzed = state.analysis?.goals?.byGoal?.find(item => item.id === g.id);
+  return analyzed?.derivedStatus || "active";
 }
 
 function goalStatusLabel(status) {
   return status === "completed" ? { text: "✓ Cumplida", color: "var(--success-text)", bg: "var(--success-bg)" }
     : status === "at_risk" ? { text: "⚠ En riesgo", color: "var(--warning-text)", bg: "var(--warning-bg)" }
+    : status === "paused" ? { text: "Pausada", color: "var(--text-secondary)", bg: "var(--card)" }
+    : status === "abandoned" ? { text: "Abandonada", color: "var(--text-muted)", bg: "var(--card)" }
     : { text: "En curso", color: "var(--teal)", bg: "var(--teal-light)" };
+}
+
+function isGoalActive(g) {
+  if (!g) return false;
+  const status = g.status || "active";
+  const pending = Number(g.current_amount) < Number(g.target_amount);
+  return pending && (status === "active" || status === "at_risk");
+}
+
+function isDebtActive(d) {
+  if (!d) return false;
+  return d.status !== "completed" && Number(d.current_balance) > 0;
 }
 
 // Calcula días hasta el próximo cobro y la fecha estimada
 // basándose en pay_day_1, pay_day_2 y pay_frequency del perfil.
-function nextPayInfo() {
-  const p = state.profile;
-  if (!p?.pay_day_1) return null; // días no configurados
-
-  const today = new Date();
-  const day = today.getDate();
-  const month = today.getMonth();
-  const year = today.getFullYear();
-
-  const days = p.pay_frequency === "biweekly" && p.pay_day_2
-    ? [p.pay_day_1, p.pay_day_2].sort((a, b) => a - b)
-    : [p.pay_day_1];
-
-  // Encontrar el próximo día de cobro
-  let nextDate = null;
-  for (const d of days) {
-    const candidate = new Date(year, month, d);
-    if (candidate > today) { nextDate = candidate; break; }
-  }
-  // Si ninguno en este mes, el primero del mes siguiente
-  if (!nextDate) nextDate = new Date(year, month + 1, days[0]);
-
-  const diffMs = nextDate - today;
-  const diffDays = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
-  const amount = Math.round(monthlyIncome() / (p.pay_frequency === "biweekly" ? 2 : 1));
-
-  return {
-    dias: diffDays,
-    fecha: nextDate.toLocaleDateString("es-DO", { day: "numeric", month: "long" }),
-    monto: amount,
-  };
-}
-
 function totalFixed() {
   return state.fixed.reduce((s, f) => s + Number(f.estimated_amount), 0);
 }
@@ -310,38 +278,10 @@ function balance() {
   return Number(state.account.computed_balance ?? state.account.initial_balance);
 }
 
-function totalDebt() {
-  return state.debts.reduce((s, d) => s + Number(d.current_balance), 0);
-}
-
-function spentThisMonthByCategory(catId) {
-  const now = new Date();
-  const start = new Date(now.getFullYear(), now.getMonth(), 1);
-  return state.transactions
-    .filter(t => t.category_id === catId && new Date(t.occurred_at) >= start && Number(t.amount) < 0)
-    .reduce((s, t) => s + Math.abs(Number(t.amount)), 0);
-}
-
 // Motor de Baseline Score: combina capacidad de ahorro, colchón de
 // liquidez, y nivel de endeudamiento relativo al ingreso. 0-100.
 // El Behavior Score se queda en "Aprendiendo" hasta que exista el
 // campo de intención por transacción (fuera de Fase 1, ver ADR-005).
-function computeBaselineScore() {
-  const income = monthlyIncome();
-  if (income <= 0) return null;
-
-  const savingsCapacity = Math.max(0, Math.min(1, (Math.max(0, disponible()) / income) * 2));
-  const liquidityBuffer = Math.max(0, Math.min(1, balance() / income)); // piso en 0: saldo negativo no arrastra por debajo
-  const debtRatio = Math.max(0, Math.min(1, totalDebt() / (income * 3)));
-
-  const score =
-    40 * savingsCapacity +
-    30 * liquidityBuffer +
-    30 * (1 - debtRatio);
-
-  return Math.round(Math.max(0, Math.min(100, score)));
-}
-
 // ================================================================
 // ================================================================
 // FINANCIAL CORE — FASE 1 (v2)
@@ -389,7 +329,7 @@ function buildFinancialData(asOf = new Date()) {
   const raw = {
     account:      state.account      ?? null,
     profile:      state.profile      ?? null,
-    transactions: state.transactions ?? [],
+    transactions: state.analysisTransactions?.length ? state.analysisTransactions : (state.transactions ?? []),
     goals:        state.goals        ?? [],
     fixed:        state.fixed        ?? [],
     debts:        state.debts        ?? [],
@@ -457,10 +397,12 @@ function buildFinancialData(asOf = new Date()) {
   const daysInMonth  = new Date(y, m + 1, 0).getDate();
   const daysLeft     = Math.max(1, daysInMonth - today.getDate());
 
-  // Compromisos financieros antes del próximo cobro
-  const debtCommitment = raw.debts.reduce((s, d) => s + (Number(d.minimum_payment) || 0), 0);
-  const goalCommitment = raw.goals
-    .filter(g => g.status !== "completed")
+  // Compromisos mensuales planificados. Sin fechas de vencimiento no se puede
+  // afirmar que todos ocurren antes del próximo cobro.
+  const activeDebts = raw.debts.filter(isDebtActive);
+  const activeGoals = raw.goals.filter(isGoalActive);
+  const debtCommitment = activeDebts.reduce((s, d) => s + (Number(d.minimum_payment) || 0), 0);
+  const goalCommitment = activeGoals
     .reduce((s, g) => {
       const created = new Date(g.created_at);
       const elapsed = (y - created.getFullYear()) * 12 + (m - created.getMonth());
@@ -570,8 +512,8 @@ function FinancialCore(fd, options = {}) {
 
   // DOMINIO: goals (describe el estado, no decide qué hacer)
   const now = asOf;
-  const activeGoals    = raw.goals.filter(g => g.status !== "completed");
-  const completedGoals = raw.goals.filter(g => g.status === "completed");
+  const activeGoals    = raw.goals.filter(isGoalActive);
+  const completedGoals = raw.goals.filter(g => g.status === "completed" || Number(g.current_amount) >= Number(g.target_amount));
   const totalPace = activeGoals.reduce((s, g) => {
     const created = new Date(g.created_at);
     const elapsed = (now.getFullYear() - created.getFullYear()) * 12 + (now.getMonth() - created.getMonth());
@@ -595,17 +537,18 @@ function FinancialCore(fd, options = {}) {
   };
 
   // DOMINIO: debts (describe el estado, no recomienda estrategia)
-  const sortedDebts       = [...raw.debts].sort((a, b) => (Number(b.interest_rate)||0) - (Number(a.interest_rate)||0));
+  const activeDebts       = raw.debts.filter(isDebtActive);
+  const sortedDebts       = [...activeDebts].sort((a, b) => (Number(b.interest_rate)||0) - (Number(a.interest_rate)||0));
   const topDebt           = sortedDebts[0] ?? null;
-  const totalDebtAmt      = raw.debts.reduce((s, d) => s + Number(d.current_balance), 0);
-  const monthlyDebtCommit = raw.debts.reduce((s, d) => s + (Number(d.minimum_payment)||0), 0);
+  const totalDebtAmt      = activeDebts.reduce((s, d) => s + Number(d.current_balance), 0);
+  const monthlyDebtCommit = activeDebts.reduce((s, d) => s + (Number(d.minimum_payment)||0), 0);
   const topRate           = Number(topDebt?.interest_rate) || 0;
   const debtRisk = topDebt
     ? (topRate >= 30 ? "critical" : topRate >= 15 ? "high" : "moderate")
     : "none";
 
   const debts = {
-    total: totalDebtAmt, count: raw.debts.length,
+    total: totalDebtAmt, count: activeDebts.length,
     topDebt, riskLevel: debtRisk,
     sorted: sortedDebts, monthlyCommitment: Math.round(monthlyDebtCommit),
   };
@@ -901,8 +844,49 @@ function runEngineTests() {
   const a7 = FinancialCore(fd7);
   assert("Caso 7: saldo positivo sin deudas → stability/building", ["stability","building","growth"].includes(a7.stage));
 
+  // Caso 8: saldo negativo, pero el próximo cobro quincenal cubre la compra → amarillo
+  const fixedDate = new Date("2026-08-01T12:00:00-04:00");
+  state = {
+    ...stateBackup,
+    profile: { pay_frequency: "biweekly", declared_monthly_income: 17000, pay_day_1: 15, pay_day_2: 30 },
+    account: { computed_balance: -800 },
+    debts: [], fixed: [], transactions: [], analysisTransactions: [], budgets: [],
+    goals: [{
+      id: "test-goal", name: "Fondo de emergencia", status: "active",
+      created_at: "2026-08-01T00:00:00Z", target_months: 10,
+      target_amount: 40000, current_amount: 0, priority: "critical",
+    }],
+  };
+  const fd8 = buildFinancialData(fixedDate);
+  const core8 = FinancialCore(fd8, { asOf: fixedDate });
+  state.analysis = { ...core8, recommendations: RecommendationEngine(core8) };
+  const p8 = buildPurchaseAnalysis(state.analysis, 10, "tenis");
+  assert("Caso 8: próximo cobro quincenal es RD$17,000", state.analysis.liquidity.nextPay?.amount === 17000);
+  assert("Caso 8: compra cubierta por próximo cobro → yellow", p8.verdict === "yellow");
+  assert("Caso 8: no usa ingreso mensual como próximo cobro", !p8.reason.includes("34,000"));
+
+  // Caso 9: ni hoy ni con el próximo cobro alcanza → rojo
+  const p9 = buildPurchaseAnalysis(state.analysis, 20000, "compra grande");
+  assert("Caso 9: compra no cubierta ni proyectada → red", p9.verdict === "red");
+
+  // Caso 10: deuda crítica impide verde aunque haya dinero hoy
+  state = {
+    ...state,
+    account: { computed_balance: 5000 },
+    debts: [{
+      id: "test-debt", name: "Tarjeta", status: "active", current_balance: 10000,
+      interest_rate: 40, minimum_payment: 1000,
+    }],
+  };
+  const fd10 = buildFinancialData(fixedDate);
+  const core10 = FinancialCore(fd10, { asOf: fixedDate });
+  state.analysis = { ...core10, recommendations: RecommendationEngine(core10) };
+  const p10 = buildPurchaseAnalysis(state.analysis, 100, "tenis");
+  assert("Caso 10: deuda >=30% impide verde", p10.verdict !== "green");
+
   // Restaurar state real
   state = stateBackup;
+  if (state.profile && state.account) computeAnalysis();
 
   const passed = results.filter(r => r.ok).length;
   const total = results.length;
@@ -914,6 +898,8 @@ function runEngineTests() {
   return { passed, total, results };
 }
 
+// Las funciones de un script type=module no quedan globales automáticamente.
+window.runEngineTests = runEngineTests;
 
 function determineStep() {
   if (!state.account) return "account";
@@ -1359,41 +1345,49 @@ function tplCoach() {
 }
 
 function buildCoachContext() {
-  const spentThisMonth = spentThisMonthTotal();
-  const bal = balance();
-  const disp = disponible();
-  const disponibleRestante = Math.round(disp - spentThisMonth);
-  const goalMonthlyNeeded = state.goals.length > 0 ? Math.round(totalGoalMonthlyPace()) : null;
-  const activeGoals = state.goals.filter(g => g.status !== "completed");
+  const fa = state.analysis || computeAnalysis();
+  const liquidity = fa?.liquidity;
+  const cashFlow = fa?.cashFlow;
+  const normalized = fa?.normalized;
+  const goalsAnalysis = fa?.goals;
+  const debtsAnalysis = fa?.debts;
+  const spending = fa?.spending;
 
-  // P17: datos estructurados para que el modelo razone mejor con hechos, no solo texto
+  const activeGoals = goalsAnalysis?.byGoal || [];
+  const activeDebts = debtsAnalysis?.sorted || [];
+  const bal = Number(liquidity?.balanceToday) || 0;
+  const disponibleRestante = Number(cashFlow?.remainingBudget) || 0;
+  const income = Number(cashFlow?.monthlyIncome) || 0;
+  const perPaycheck = Number(normalized?.perPaycheck) || 0;
+
   const structured = {
     perfil: {
-      frecuencia_cobro: state.profile?.pay_frequency === "biweekly" ? "quincenal" : "mensual",
-      // DISTINCIÓN CRÍTICA: ingreso_por_cobro es lo que entra CADA vez.
-      // ingreso_mensual_total es la suma de TODOS los cobros del mes.
-      // Para usuarios quincenales, el próximo cobro es ingreso_por_cobro, NO ingreso_mensual_total.
-      ingreso_por_cobro: Math.round(monthlyIncome() / (state.profile?.pay_frequency === "biweekly" ? 2 : 1)),
-      ingreso_mensual_total: Math.round(monthlyIncome()),
+      frecuencia_cobro: normalized?.payFrequency === "biweekly" ? "quincenal" : "mensual",
+      ingreso_por_cobro: Math.round(perPaycheck),
+      ingreso_mensual_total: Math.round(income),
       saldo_actual: Math.round(bal),
-      disponible_restante_este_mes: disponibleRestante,
+      presupuesto_restante_este_mes: Math.round(disponibleRestante),
+      dinero_libre_hoy: Math.round(Number(liquidity?.freeCashToday) || 0),
+      dinero_libre_proyectado: liquidity?.freeCashProjected == null
+        ? null
+        : Math.round(Number(liquidity.freeCashProjected)),
     },
-    // P12: gastos fijos explícitos — antes el coach decía "no tengo info"
     gastos_fijos: state.fixed.map(f => ({
       nombre: f.name,
       monto: Number(f.estimated_amount),
       categoria: f.categories?.name || "Sin categoría",
     })),
-    total_gastos_fijos: Math.round(totalFixed()),
-    gastos_variables_mes: Math.round(spentThisMonth),
+    total_gastos_fijos: Math.round(Number(cashFlow?.fixedExpenses) || 0),
+    gastos_variables_mes: Math.round(Number(cashFlow?.variableExpenses) || 0),
     metas: activeGoals.map(g => ({
       nombre: g.name,
       objetivo: Number(g.target_amount),
       ahorrado: Number(g.current_amount),
       falta: Math.max(0, Number(g.target_amount) - Number(g.current_amount)),
-      aporte_mensual_necesario: Math.round(goalMonthlyPace(g)),
+      aporte_mensual_necesario: Math.round(Number(g.pace) || 0),
+      estado: g.derivedStatus,
     })),
-    deudas: state.debts.map(d => ({
+    deudas: activeDebts.map(d => ({
       nombre: d.name,
       tipo: d.debt_type,
       saldo_pendiente: Number(d.current_balance),
@@ -1402,7 +1396,7 @@ function buildCoachContext() {
     })),
     presupuestos: state.budgets.map(b => {
       const cat = categories.find(c => c.id === b.category_id);
-      const spent = spentThisMonthByCategory(b.category_id);
+      const spent = Number(spending?.byCategory?.[b.category_id]) || 0;
       return {
         categoria: cat?.name || "Sin categoría",
         limite: Number(b.amount),
@@ -1412,7 +1406,6 @@ function buildCoachContext() {
     }),
   };
 
-  // Resúmenes en lenguaje natural (compactos, para el prompt de texto)
   const goalSummary = activeGoals.length > 0
     ? activeGoals.map(g => {
         const falta = Math.max(0, Number(g.target_amount) - Number(g.current_amount));
@@ -1427,45 +1420,45 @@ function buildCoachContext() {
   const budgetSummary = state.budgets.length > 0
     ? state.budgets.map(b => {
         const cat = categories.find(c => c.id === b.category_id);
-        const remaining = Math.round(Number(b.amount) - spentThisMonthByCategory(b.category_id));
-        return `${cat?.name || "Sin categoría"}: queda RD$${remaining} de RD$${b.amount}`;
+        const spent = Number(spending?.byCategory?.[b.category_id]) || 0;
+        return `${cat?.name || "Sin categoría"}: queda RD$${Math.round(Number(b.amount) - spent)} de RD$${b.amount}`;
       }).join("; ")
     : null;
 
-  const debtsSummary = state.debts.length > 0
-    ? state.debts.map(d => {
+  const debtsSummary = activeDebts.length > 0
+    ? activeDebts.map(d => {
         const tasa = d.interest_rate ? ` al ${d.interest_rate}% anual` : "";
         const cuota = d.minimum_payment ? ` (cuota: RD$${Math.round(d.minimum_payment)}/mes)` : "";
         return `${d.name}: debe RD$${d.current_balance}${tasa}${cuota}`;
       }).join("; ")
     : null;
 
-  const nextPay = nextPayInfo();
-  const freq = state.profile?.pay_frequency;
-
   return {
     balance: Math.round(bal),
-    disponibleRestante,
-    income: Math.round(monthlyIncome()),       // ingreso mensual TOTAL (normalizado)
-    perPaycheck: Math.round(monthlyIncome() / (freq === "biweekly" ? 2 : 1)), // lo que ENTRA cada cobro
-    payFrequency: freq,
-    payFrequencyLabel: freq === "biweekly" ? "quincenal" : "mensual",
-    totalFixed: Math.round(totalFixed()),
-    nextPay: nextPay ? `en ${nextPay.dias} día${nextPay.dias !== 1 ? "s" : ""} (${nextPay.fecha}) por ${money(nextPay.monto)}` : null,
+    disponibleRestante: Math.round(disponibleRestante),
+    income: Math.round(income),
+    perPaycheck: Math.round(perPaycheck),
+    payFrequency: normalized?.payFrequency || null,
+    payFrequencyLabel: normalized?.payFrequency === "biweekly" ? "quincenal" : "mensual",
+    totalFixed: Math.round(Number(cashFlow?.fixedExpenses) || 0),
+    nextPay: liquidity?.nextPay?.summary || null,
     goalSummary,
     goalCount: activeGoals.length,
-    goalMonthlyNeeded,
+    goalMonthlyNeeded: activeGoals.length > 0 ? Math.round(Number(goalsAnalysis?.totalMonthlyPace) || 0) : null,
     fixedSummary,
     budgetSummary,
     debtsSummary,
     structured,
-    // Último análisis de ¿Lo compro? — para que el coach no contradiga el veredicto
     lastPurchaseVerdict: lastPurchaseAnalysis ? {
       verdict: lastPurchaseAnalysis.verdict,
       verdictLabel: lastPurchaseAnalysis.verdictLabel,
       reason: lastPurchaseAnalysis.reason,
       item: lastPurchaseAnalysis.meta?.itemName ?? null,
       amount: lastPurchaseAnalysis.meta?.amount ?? null,
+      canBuyNow: lastPurchaseAnalysis.affordability?.canBuyNow ?? null,
+      canBuyAfterNextIncome: lastPurchaseAnalysis.affordability?.canBuyAfterNextIncome ?? null,
+      shouldBuy: lastPurchaseAnalysis.judgment?.shouldBuy ?? null,
+      isBestUseOfMoney: lastPurchaseAnalysis.judgment?.isBestUseOfMoney ?? null,
     } : null,
   };
 }
@@ -1522,7 +1515,7 @@ function wireCoach() {
 }
 
 // ================================================================
-// MOTOR DE DECISIÓN v2 — buildPurchaseAnalysis(amount, itemName)
+// MOTOR DE DECISIÓN v2 — buildPurchaseAnalysis(financialAnalysis, amount, itemName)
 // Fuente única de verdad. La UI y el Coach consumen este objeto.
 // Nunca inventar información — si no hay datos, decirlo explícito.
 // ================================================================
@@ -1530,263 +1523,285 @@ function scoreLabel(s) {
   return s >= 80 ? "Excelente" : s >= 60 ? "Buena" : s >= 40 ? "Moderada" : s >= 20 ? "Baja" : "Muy baja";
 }
 
-function buildPurchaseAnalysis(amount, itemName) {
-  const bal        = balance();
-  const disp       = disponible();
-  const spent      = spentThisMonthTotal();
-  const dispRest   = disp - spent;
-  const afterPurch = dispRest - amount;
-  const balAfter   = bal - amount;
-  const income     = monthlyIncome();
-  const activeGoals = state.goals.filter(g => g.status !== "completed");
-  const goalPace   = totalGoalMonthlyPace();
-  const daysInMonth = new Date(new Date().getFullYear(), new Date().getMonth()+1, 0).getDate();
-  const dayOfMonth  = new Date().getDate();
-  const daysLeft    = Math.max(1, daysInMonth - dayOfMonth);
+function buildPurchaseAnalysis(financialAnalysis, amount, itemName) {
+  const purchaseAmount = Math.max(0, Number(amount) || 0);
+  const fa = financialAnalysis;
 
-  // BUG 3 FIX: detectar si el ingreso todavía no ha entrado (bigGap)
-  // Si el saldo real es mucho menor que el disponible planeado,
-  // probablemente la quincena/sueldo aún no ha caído.
-  const bigGap = dispRest - bal > Math.max(dispRest * 0.3, 500) && dispRest > 0;
+  if (!fa?.liquidity || !fa?.cashFlow) {
+    return {
+      verdict: "neutral", score: 0, stars: 0, verdictLabel: "", reason: "",
+      summary: "Completa tu perfil para analizar una compra.", coachPrompt: "",
+      purchaseAnalysis: null,
+      dimensions: {
+        liquidez: { score: 0, label: "Sin datos", msg: "Completa tu perfil financiero." },
+        deudas: { score: 0, label: "Sin datos", msg: "Completa tu perfil financiero." },
+        metas: { score: 0, label: "Sin datos", msg: "Completa tu perfil financiero." },
+        habitos: { score: 0, label: "Sin datos", msg: "Todavía no hay suficiente historial." },
+        bienestar: { score: 0, label: "Sin datos", msg: "Completa tu perfil financiero." },
+        oportunidad: { title: "", items: [] },
+      },
+      actions: { canBuy: false, registerPurchase: false, saveWishlist: false },
+      affordability: { canBuyNow: false, canBuyAfterNextIncome: false },
+      judgment: { shouldBuy: false, isBestUseOfMoney: false, verdict: "neutral" },
+      meta: { amount: purchaseAmount, itemName, balAfter: null, dispRestante: null, afterPurch: null },
+    };
+  }
 
-  // Próximo cobro: se usa para determinar si la compra será posible después,
-  // independientemente de si faltan 5, 14 o más días. La cercanía del cobro
-  // solo afecta el mensaje y la puntuación, nunca la matemática.
-  const nextPay = nextPayInfo();
-  const hasNextPay = nextPay !== null && nextPay.dias > 0;
-  const cobrarPronto = hasNextPay && nextPay.dias <= 5;
-  const balProyectado = hasNextPay ? bal + nextPay.monto : bal;
-  const balAfterProyectado = balProyectado - amount;
-  const canBuyToday = bal >= amount;
-  const canBuyAfterNextPay = !canBuyToday && hasNextPay && balProyectado >= amount;
+  const { liquidity, cashFlow, goals, debts, financialHealth, recommendations } = fa;
+  const bal = Number(liquidity.balanceToday) || 0;
+  const projectedBalance = liquidity.projectedBalance == null ? null : Number(liquidity.projectedBalance);
+  const nextPay = liquidity.nextPay;
+  const daysLeft = Math.max(1, Number(liquidity.daysLeftInMonth) || 1);
+  const balanceAfterToday = bal - purchaseAmount;
+  const balanceAfterProjected = projectedBalance == null ? null : projectedBalance - purchaseAmount;
+  const freeCashAfterToday = Number(liquidity.freeCashToday || 0) - purchaseAmount;
+  const freeCashAfterProjected = liquidity.freeCashProjected == null
+    ? null
+    : Number(liquidity.freeCashProjected) - purchaseAmount;
+  const remainingBudgetAfter = Number(cashFlow.remainingBudget || 0) - purchaseAmount;
+  const operatingSurplusAfter = Number(cashFlow.operatingSurplus || 0) - purchaseAmount;
 
-  // Saldo de referencia para dimensiones posteriores. Nunca convierte una
-  // compra futura en una compra disponible hoy; el veredicto lo distingue.
-  const balEfectivo = canBuyToday ? bal : (canBuyAfterNextPay ? balProyectado : bal);
-  const balAfterEfectivo = balEfectivo - amount;
+  const canBuyToday = purchaseAmount > 0 && bal >= purchaseAmount;
+  const canBuyAfterNextIncome = purchaseAmount > 0 && !canBuyToday && projectedBalance !== null && projectedBalance >= purchaseAmount;
+  const criticalDebt = debts?.riskLevel === "critical";
+  const goalsAtRisk = (goals?.byGoal || []).some(g => g.derivedStatus === "at_risk");
+  const commitmentsCoveredToday = freeCashAfterToday >= 0;
+  const commitmentsCoveredProjected = freeCashAfterProjected !== null && freeCashAfterProjected >= 0;
 
-  // BUG 4 FIX: si el saldo real es negativo, el dispRest planeado
-  // no refleja la situación real. Usar el menor de los dos.
-  const dispRestReal = Math.min(dispRest, bal > 0 ? dispRest : dispRest + bal);
-
-  // 1. LIQUIDEZ (peso 35%)
+  // 1. LIQUIDEZ
   let liqS, liqLabel, liqMsg;
-  if (amount === 0) {
+  if (purchaseAmount === 0) {
     liqS = 100; liqLabel = "—";
     liqMsg = "Ingresa un monto para ver el análisis de liquidez.";
+  } else if (canBuyToday && commitmentsCoveredToday) {
+    const pct = balanceAfterToday / Math.max(1, bal);
+    liqS = pct >= 0.6 ? 90 : pct >= 0.4 ? 75 : pct >= 0.2 ? 60 : pct >= 0.05 ? 45 : 30;
+    liqLabel = scoreLabel(liqS);
+    liqMsg = `Puedes pagarla hoy. Te quedarían ${money(Math.round(balanceAfterToday))} en la cuenta y ${money(Math.round(freeCashAfterToday))} libres después de tus compromisos planificados.`;
   } else if (canBuyToday) {
-    const pct = balAfter / Math.max(1, bal);
-    liqS = pct >= 0.6 ? 90 : pct >= 0.4 ? 75 : pct >= 0.2 ? 55 : pct >= 0.05 ? 35 : 15;
+    liqS = 30; liqLabel = "Comprometida";
+    liqMsg = `Tienes el dinero en la cuenta, pero la compra usaría ${money(Math.abs(Math.round(freeCashAfterToday)))} reservado para deudas o metas. Puedes pagarla físicamente, pero no sin afectar compromisos.`;
+  } else if (canBuyAfterNextIncome) {
+    liqS = commitmentsCoveredProjected ? (nextPay?.daysAway <= 5 ? 55 : nextPay?.daysAway <= 15 ? 45 : 35) : 25;
     liqLabel = scoreLabel(liqS);
-    const daily = balAfter / daysLeft;
-    liqMsg = `Puedes pagarla hoy. Te quedarían ${money(Math.round(balAfter))} en cuenta, aproximadamente ${money(Math.round(daily))}/día durante los ${daysLeft} días restantes del mes.`;
-  } else if (canBuyAfterNextPay) {
-    liqS = cobrarPronto ? 55 : nextPay.dias <= 15 ? 40 : 30;
-    liqLabel = scoreLabel(liqS);
-    liqMsg = `Hoy no tienes ${money(amount)} en cuenta (saldo: ${money(bal)}). Cuando recibas tu próximo cobro de ${money(nextPay.monto)} en ${nextPay.dias} día${nextPay.dias !== 1 ? "s" : ""}, tendrías ${money(balProyectado)} y, después de la compra, te quedarían ${money(balAfterProyectado)}. La compra sería posible entonces, no hoy.`;
+    liqMsg = `Hoy no tienes ${money(purchaseAmount)} en cuenta (saldo: ${money(bal)}). Después de tu próximo cobro de ${money(nextPay?.amount || 0)} tendrías ${money(projectedBalance)} y, tras la compra, ${money(balanceAfterProjected)}. ${commitmentsCoveredProjected ? "La compra sería posible entonces, no hoy." : "El saldo cubriría la compra, pero tus compromisos planificados quedarían sin cubrir."}`;
   } else {
     liqS = 5; liqLabel = "Muy baja";
-    if (hasNextPay) {
-      const faltante = Math.max(0, amount - balProyectado);
-      liqMsg = `Hoy no tienes ${money(amount)} en cuenta (saldo: ${money(bal)}). Después de tu próximo cobro de ${money(nextPay.monto)} tendrías ${money(balProyectado)}, por lo que todavía faltarían ${money(faltante)}.`;
-    } else if (bigGap) {
-      liqMsg = `Hoy no tienes ${money(amount)} en cuenta (saldo: ${money(bal)}). Parece que tu ingreso de este período aún no ha entrado.`;
+    if (nextPay) {
+      const faltante = Math.max(0, purchaseAmount - Number(projectedBalance || 0));
+      liqMsg = `Hoy tienes ${money(bal)}. Después de tu próximo cobro de ${money(nextPay.amount)} tendrías ${money(projectedBalance || 0)} y todavía faltarían ${money(faltante)}.`;
     } else {
-      liqMsg = `Hoy no tienes ${money(amount)} en cuenta (saldo: ${money(bal)}).`;
+      liqMsg = `Hoy no tienes ${money(purchaseAmount)} en cuenta (saldo: ${money(bal)}) y no hay un próximo cobro configurado para proyectar la compra.`;
     }
   }
 
-  // 2. DEUDAS (peso 20% — P4: nueva dimensión)
+  // 2. DEUDAS
   let debtS, debtLabel, debtMsg;
-  const topDebt = state.debts.length > 0
-    ? [...state.debts].sort((a,b) => (Number(b.interest_rate)||0) - (Number(a.interest_rate)||0))[0]
-    : null;
-  if (state.debts.length === 0) {
+  const topDebt = debts?.topDebt || null;
+  if (!topDebt) {
     debtS = 90; debtLabel = "Sin deudas";
-    debtMsg = "No tienes deudas registradas. Esta compra no compite con ningún compromiso financiero.";
-  } else if (topDebt && Number(topDebt.interest_rate) >= 30) {
+    debtMsg = "No tienes deudas activas registradas.";
+  } else if (criticalDebt) {
     debtS = 25; debtLabel = "Alta prioridad";
-    debtMsg = `Tienes una deuda con "${topDebt.name}" al ${topDebt.interest_rate}% anual. Financieramente conviene reducir esa deuda antes de hacer esta compra.`;
-  } else if (topDebt && Number(topDebt.interest_rate) >= 15) {
+    debtMsg = `Tienes una deuda con "${topDebt.name}" al ${topDebt.interest_rate}% anual. Esta compra nunca puede recibir verde mientras esa deuda siga activa.`;
+  } else if (debts.riskLevel === "high") {
     debtS = 50; debtLabel = "Moderada";
-    debtMsg = `Tienes deudas activas (tasa más alta: ${topDebt.interest_rate}% anual). Considera si esta compra puede esperar hasta reducir algo esa deuda.`;
+    debtMsg = `Tu deuda activa de mayor tasa está al ${topDebt.interest_rate}% anual. Conviene evaluar si la compra puede esperar.`;
   } else {
     debtS = 75; debtLabel = "Manejable";
-    debtMsg = `Tus deudas tienen tasas bajas. Esta compra no genera un conflicto crítico con tus compromisos financieros.`;
+    debtMsg = "Tus deudas activas no presentan una tasa crítica.";
   }
 
-  // 3. METAS (peso 25%)
+  // 3. METAS Y PRESUPUESTO MENSUAL
   let goalsS, goalsLabel, goalsMsg;
+  const activeGoals = goals?.active || [];
   if (activeGoals.length === 0) {
     goalsS = 80; goalsLabel = "Sin metas";
-    goalsMsg = "No tienes metas activas registradas. Esta compra no afecta ningún objetivo de ahorro.";
-  } else if (amount === 0) {
+    goalsMsg = "No tienes metas activas registradas.";
+  } else if (purchaseAmount === 0) {
     goalsS = 80; goalsLabel = "—";
     goalsMsg = "Ingresa un monto para ver el impacto en tus metas.";
-  } else if (afterPurch >= goalPace) {
-    goalsS = 90; goalsLabel = "Excelente";
-    goalsMsg = `Después de la compra te quedan ${money(Math.round(afterPurch))} disponibles — cubre el aporte mensual de tus metas (${money(Math.round(goalPace))}).`;
-  } else if (afterPurch >= 0) {
-    const shortfall = goalPace - afterPurch;
-    const daysDelay = Math.ceil((shortfall / income) * 30);
+  } else if (remainingBudgetAfter >= 0) {
+    goalsS = goalsAtRisk ? 65 : 90;
+    goalsLabel = goalsAtRisk ? "Con atención" : "Excelente";
+    goalsMsg = `En tu plan mensual, después de la compra quedarían ${money(Math.round(remainingBudgetAfter))} luego de cubrir gastos, deudas y aportes a metas. Esto describe presupuesto mensual, no dinero disponible hoy.`;
+  } else if (operatingSurplusAfter >= 0) {
     goalsS = 40; goalsLabel = "Baja";
-    goalsMsg = `Te faltarían ${money(Math.round(shortfall))} para cubrir tus metas este mes, equivalente a ~${daysDelay} días de retraso.`;
+    goalsMsg = `La compra cabe dentro del ingreso mensual, pero dejaría un faltante de ${money(Math.abs(Math.round(remainingBudgetAfter)))} para tus deudas o metas planificadas.`;
   } else {
     goalsS = 15; goalsLabel = "Muy baja";
-    goalsMsg = `Esta compra supera tu disponible mensual (${money(Math.round(dispRest))}). Afectaría directamente el avance de tus metas.`;
+    goalsMsg = `La compra supera en ${money(Math.abs(Math.round(operatingSurplusAfter)))} el margen operativo del mes antes de completar tus compromisos.`;
   }
 
-  // 4. HÁBITOS (peso 10% — sin historial aún)
-  const habitsS = 70; const habitsLabel = "Sin datos";
+  // 4. HÁBITOS
+  const habitsS = 70;
+  const habitsLabel = "Sin datos";
   const habitsMsg = "Todavía no hay suficiente historial para detectar patrones de comportamiento.";
 
-  // 5. BIENESTAR (peso 10% — lenguaje orientado a decisiones)
+  // 5. BIENESTAR
   let wellS, wellLabel, wellMsg;
-  const saludable = computeBaselineScore() >= 60;
-  if (amount === 0) {
+  const healthScore = Number(financialHealth?.score);
+  const healthy = Number.isFinite(healthScore) && healthScore >= 60;
+  if (purchaseAmount === 0) {
     wellS = 80; wellLabel = "—";
     wellMsg = "Ingresa un monto para evaluar el impacto en tu bienestar financiero.";
-  } else if (canBuyToday && afterPurch >= 0 && saludable) {
+  } else if (canBuyToday && commitmentsCoveredToday && remainingBudgetAfter >= 0 && healthy) {
     wellS = 90; wellLabel = "Excelente";
-    wellMsg = "Tus finanzas siguen saludables incluso realizando esta compra. Tienes margen para este gasto.";
-  } else if (canBuyToday && afterPurch >= 0) {
+    wellMsg = "Puedes pagarla hoy sin dejar descubiertos tus compromisos y tu salud financiera se mantiene estable.";
+  } else if (canBuyToday && commitmentsCoveredToday) {
     wellS = 60; wellLabel = "Buena";
-    wellMsg = "La compra es posible hoy. Ajusta tus gastos variables el resto del mes para mantener el equilibrio.";
-  } else if (canBuyAfterNextPay && afterPurch >= 0) {
-    wellS = saludable ? 65 : 50;
-    wellLabel = saludable ? "Buena" : "Moderada";
-    wellMsg = `La compra no es posible hoy, pero sería viable después de tu próximo cobro. Espera hasta recibirlo antes de decidir.`;
+    wellMsg = "La compra es posible hoy, aunque reduce tu margen. Mantén controlados los gastos variables restantes.";
+  } else if (canBuyAfterNextIncome && commitmentsCoveredProjected && remainingBudgetAfter >= 0) {
+    wellS = healthy ? 65 : 50;
+    wellLabel = healthy ? "Buena" : "Moderada";
+    wellMsg = "No es posible hoy, pero podría ser viable después del próximo cobro. Espera a que el dinero esté realmente en la cuenta.";
   } else {
     wellS = 25; wellLabel = "Baja";
-    wellMsg = "Esta compra reduciría demasiado tu margen financiero. No es recomendable realizarla con tu situación actual.";
+    wellMsg = "La compra reduciría demasiado tu margen o dejaría compromisos sin cubrir.";
   }
 
-  // P1+P2: SCORE COMPUESTO (escala 0-100 corregida, dividiendo por el máximo posible)
-  // Pesos: liq 35, deuda 20, metas 25, hábitos 10, bienestar 10 = 100
-  const rawScore = amount === 0 ? 0 :
+  const rawScore = purchaseAmount === 0 ? 0 :
     liqS * 0.35 + debtS * 0.20 + goalsS * 0.25 + habitsS * 0.10 + wellS * 0.10;
   const score = Math.round(rawScore);
 
-  // VEREDICTO FINAL
-  // Verde: el dinero está disponible hoy y las demás dimensiones son sanas.
-  // Amarillo: no está disponible hoy, pero el próximo cobro lo cubriría,
-  // o existe una condición financiera relevante.
-  // Rojo: ni hoy ni con el próximo cobro conocido alcanza.
+  const shouldBuy = canBuyToday && commitmentsCoveredToday && remainingBudgetAfter >= 0 && !criticalDebt;
+  const strategicPriority = recommendations?.nextBestAction || null;
+  const isBestUseOfMoney = shouldBuy && (!strategicPriority || Number(strategicPriority.impact || 0) < 90);
+
   let verdict;
-  if (amount === 0) {
-    verdict = "neutral";
-  } else if (!canBuyToday && canBuyAfterNextPay) {
-    verdict = "yellow";
-  } else if (!canBuyToday) {
-    verdict = "red";
-  } else if (liqS <= 10) {
-    verdict = "red";
-  } else if (debtS < 50) {
-    verdict = score >= 45 ? "yellow" : "red";
-  } else if (score >= 70) {
-    verdict = "green";
-  } else if (score >= 45) {
-    verdict = "yellow";
-  } else {
-    verdict = "red";
-  }
+  if (purchaseAmount === 0) verdict = "neutral";
+  else if (!canBuyToday && canBuyAfterNextIncome) verdict = "yellow";
+  else if (!canBuyToday) verdict = "red";
+  else if (!shouldBuy || !isBestUseOfMoney) verdict = "yellow";
+  else verdict = "green";
 
   const stars = verdict === "neutral" ? 0 : score >= 85 ? 5 : score >= 70 ? 4 : score >= 55 ? 3 : score >= 40 ? 2 : 1;
 
-  // Labels contextuales — no genéricos
   let verdictLabel, reason;
   if (verdict === "neutral") {
     verdictLabel = ""; reason = "";
   } else if (verdict === "green") {
     verdictLabel = "🟢 Compra recomendable";
-    reason = `Tienes ${money(bal)} en cuenta — cubre la compra y tus metas no se ven afectadas.`;
-  } else if (verdict === "yellow" && !canBuyToday && canBuyAfterNextPay) {
+    reason = `Puedes pagarla hoy, tus compromisos quedan cubiertos y no existe una prioridad financiera más urgente.`;
+  } else if (!canBuyToday && canBuyAfterNextIncome) {
     verdictLabel = "🟡 Viable cuando cobres";
-    reason = `Hoy no tienes los ${money(amount)} (saldo: ${money(bal)}). Después de tu próximo cobro de ${money(nextPay.monto)} en ${nextPay.dias} día${nextPay.dias !== 1 ? "s" : ""}, tendrías ${money(balProyectado)} y podrías realizarla. Espera a recibir ese dinero.`;
-  } else if (verdict === "yellow" && debtS < 50) {
-    verdictLabel = "🟡 Viable, pero tienes una deuda prioritaria";
-    reason = `Puedes pagar la compra, pero tienes una deuda con "${topDebt?.name}" al ${topDebt?.interest_rate}% anual. Financieramente conviene reducir esa deuda primero.`;
-  } else if (verdict === "yellow") {
-    verdictLabel = "🟡 Viable, pero ajusta tus gastos";
-    reason = `Puedes hacer la compra, pero te quedaría menos margen para el resto del mes. Revisa si puedes recortar algún gasto variable.`;
-  } else if (verdict === "red" && !canBuyToday) {
+    reason = `Hoy tienes ${money(bal)}. Después de tu próximo cobro de ${money(nextPay?.amount || 0)} tendrías ${money(projectedBalance || 0)} y podrías pagar ${money(purchaseAmount)}. Espera a recibir el dinero; hoy no está disponible.`;
+  } else if (!canBuyToday) {
     verdictLabel = "🔴 No alcanza";
-    if (hasNextPay) {
-      const faltante = Math.max(0, amount - balProyectado);
-      reason = `Hoy tienes ${money(bal)} en cuenta. Después de tu próximo cobro de ${money(nextPay.monto)} en ${nextPay.dias} día${nextPay.dias !== 1 ? "s" : ""}, tendrías ${money(balProyectado)}; todavía faltarían ${money(faltante)} para completar ${money(amount)}.`;
+    if (nextPay) {
+      const faltante = Math.max(0, purchaseAmount - Number(projectedBalance || 0));
+      reason = `Hoy tienes ${money(bal)}. Después de tu próximo cobro tendrías ${money(projectedBalance || 0)} y aún faltarían ${money(faltante)}.`;
     } else {
-      reason = `Hoy tienes ${money(bal)} en cuenta y no hay un próximo cobro configurado que permita proyectar esta compra.`;
+      reason = `Hoy tienes ${money(bal)} y no hay un próximo cobro configurado que permita cubrir la compra.`;
     }
+  } else if (criticalDebt) {
+    verdictLabel = "🟡 Puedes pagarla, pero la deuda es prioritaria";
+    reason = `El dinero está hoy en la cuenta, pero tienes una deuda al ${topDebt?.interest_rate}% anual. Financiera y estratégicamente, reducir esa deuda es un mejor uso del dinero.`;
+  } else if (!commitmentsCoveredToday || remainingBudgetAfter < 0) {
+    verdictLabel = "🟡 Puedes pagarla, pero compromete tu plan";
+    reason = `La cuenta cubre la compra, pero dejarías sin cubrir ${money(Math.max(0, Math.abs(Math.round(Math.min(freeCashAfterToday, remainingBudgetAfter)))))} de compromisos o presupuesto mensual.`;
   } else {
-    verdictLabel = "🔴 No recomendable ahora";
-    reason = `Esta compra compromete tu liquidez o tus compromisos financieros actuales.`;
+    verdictLabel = "🟡 Viable, pero no es tu mejor uso del dinero";
+    reason = strategicPriority
+      ? `${strategicPriority.label} tiene mayor impacto financiero en este momento.`
+      : "La compra es posible, pero conviene preservar más margen.";
   }
 
-  const summary = amount === 0
-    ? "Ingresa el monto para analizar la compra."
-    : reason;
-
-  // P6: OPORTUNIDADES ordenadas por impacto financiero
-  let opportunityItems = [];
-  if (amount > 0) {
+  const opportunityItems = [];
+  let opportunityTitle = "";
+  if (purchaseAmount > 0 && canBuyToday) {
+    opportunityTitle = `Con ${money(purchaseAmount)} también podrías:`;
     if (topDebt && Number(topDebt.interest_rate) > 0) {
-      const interesAhorro = Math.round(amount * (Number(topDebt.interest_rate)/100/12));
-      opportunityItems.push({ stars: 5, text: `Abonar ${money(amount)} a tu deuda "${topDebt.name}"`, reason: `Ahorrarías ~${money(interesAhorro)} en intereses este mes.` });
+      const interesAhorro = Math.round(purchaseAmount * (Number(topDebt.interest_rate) / 100 / 12));
+      opportunityItems.push({ stars: 5, text: `Abonar ${money(purchaseAmount)} a tu deuda "${topDebt.name}"`, reason: `Reducirías intereses y saldo pendiente; el ahorro estimado del primer mes sería ~${money(interesAhorro)}.` });
     }
-    if (activeGoals.length > 0) {
-      const topGoal = activeGoals[0];
+    const topGoal = goals?.byGoal?.[0];
+    if (topGoal) {
       const falta = Math.max(0, Number(topGoal.target_amount) - Number(topGoal.current_amount));
-      if (amount <= falta) opportunityItems.push({ stars: 4, text: `Aportar ${money(amount)} a tu meta "${topGoal.name}"`, reason: `Acelerarías tu progreso hacia el objetivo.` });
+      if (purchaseAmount <= falta) opportunityItems.push({ stars: 4, text: `Aportar ${money(purchaseAmount)} a tu meta "${topGoal.name}"`, reason: "Acelerarías el progreso del objetivo." });
     }
-    const fondoNecesario = totalFixed() * 3;
-    if (bal < fondoNecesario) opportunityItems.push({ stars: 3, text: `Fortalecer tu fondo de emergencia`, reason: `Te faltan ~${money(Math.round(fondoNecesario - bal))} para 3 meses de gastos fijos.` });
+    const fixedExpenses = Number(cashFlow.fixedExpenses) || 0;
+    if (fixedExpenses > 0) {
+      const emergencyTarget = fixedExpenses * 3;
+      const emergencyGoal = (goals?.active || []).find(g => g.name?.toLowerCase().includes("emergencia"));
+      const emergencySaved = emergencyGoal ? Number(emergencyGoal.current_amount) || 0 : 0;
+      if (emergencySaved < emergencyTarget) {
+        opportunityItems.push({ stars: 3, text: "Fortalecer tu fondo de emergencia", reason: `Meta de referencia: ${money(emergencyTarget)}. Has registrado ${money(emergencySaved)} en una meta de emergencia.` });
+      }
+    }
+  } else if (purchaseAmount > 0) {
+    opportunityTitle = "Antes de comprar, considera:";
+    if (canBuyAfterNextIncome) {
+      opportunityItems.push({ stars: 5, text: "Esperar al próximo cobro", reason: "La compra sería posible después de que el dinero entre realmente a la cuenta." });
+    } else {
+      opportunityItems.push({ stars: 5, text: "Recuperar un saldo positivo", reason: `Tu saldo actual es ${money(bal)}; primero necesitas estabilizar la liquidez.` });
+    }
   }
 
-  // Coach recibe el análisis completo como DATO FIJO — no puede contradecirlo.
-  // Su rol es explicar, ampliar y responder preguntas sobre el veredicto.
   const itemText = itemName ? `"${itemName}"` : "un artículo";
-  const purchaseAnalysisForCoach = amount > 0 ? {
+  const purchaseAnalysisForCoach = purchaseAmount > 0 ? {
     item: itemText,
-    amount,
+    amount: purchaseAmount,
     verdict,
     verdictLabel,
     reason,
     score,
+    affordability: { canBuyNow: canBuyToday, canBuyAfterNextIncome },
+    judgment: { shouldBuy, isBestUseOfMoney },
     dimensions: {
       liquidez: { score: liqS, msg: liqMsg },
-      deudas:   { score: debtS, msg: debtMsg },
-      metas:    { score: goalsS, msg: goalsMsg },
-      bienestar:{ score: wellS, msg: wellMsg },
+      deudas: { score: debtS, msg: debtMsg },
+      metas: { score: goalsS, msg: goalsMsg },
+      bienestar: { score: wellS, msg: wellMsg },
     },
   } : null;
 
-  const coachPrompt = amount > 0
-    ? `Resultado del motor de decisión (VEREDICTO OFICIAL — no recalcules ni contradigas):
-
-${JSON.stringify(purchaseAnalysisForCoach, null, 0)}
-
-Explícame por qué el motor llegó a este veredicto y qué alternativas tengo.`
+  const coachPrompt = purchaseAmount > 0
+    ? `Resultado del motor de decisión (VEREDICTO OFICIAL — no recalcules ni contradigas):\n\n${JSON.stringify(purchaseAnalysisForCoach)}\n\nExplica el resultado y las alternativas usando únicamente estos datos.`
     : "";
 
   return {
-    verdict, score, stars, verdictLabel, reason, summary, coachPrompt,
+    verdict, score, stars, verdictLabel, reason,
+    summary: purchaseAmount === 0 ? "Ingresa el monto para analizar la compra." : reason,
+    coachPrompt,
     purchaseAnalysis: purchaseAnalysisForCoach,
+    affordability: {
+      canBuyNow: canBuyToday,
+      canBuyAfterNextIncome,
+      balanceAfterToday,
+      balanceAfterProjected,
+      freeCashAfterToday,
+      freeCashAfterProjected,
+    },
+    judgment: {
+      shouldBuy,
+      isBestUseOfMoney,
+      verdict,
+      nextBestAction: strategicPriority,
+    },
     dimensions: {
-      liquidez:    { score: liqS,   label: liqLabel,   msg: liqMsg   },
-      deudas:      { score: debtS,  label: debtLabel,  msg: debtMsg  },
-      metas:       { score: goalsS, label: goalsLabel, msg: goalsMsg },
-      habitos:     { score: habitsS,label: habitsLabel,msg: habitsMsg},
-      bienestar:   { score: wellS,  label: wellLabel,  msg: wellMsg  },
-      oportunidad: { items: opportunityItems },
+      liquidez: { score: liqS, label: liqLabel, msg: liqMsg },
+      deudas: { score: debtS, label: debtLabel, msg: debtMsg },
+      metas: { score: goalsS, label: goalsLabel, msg: goalsMsg },
+      habitos: { score: habitsS, label: habitsLabel, msg: habitsMsg },
+      bienestar: { score: wellS, label: wellLabel, msg: wellMsg },
+      oportunidad: { title: opportunityTitle, items: opportunityItems },
     },
     actions: {
-      canBuy:           bal >= amount && amount > 0,
-      registerPurchase: bal >= amount && amount > 0,
-      saveWishlist:     amount > 0,
+      canBuy: canBuyToday,
+      registerPurchase: canBuyToday,
+      saveWishlist: purchaseAmount > 0,
     },
-    meta: { amount, itemName, balAfter, dispRestante: dispRest, afterPurch },
+    meta: {
+      amount: purchaseAmount,
+      itemName,
+      balAfter: balanceAfterToday,
+      dispRestante: cashFlow.remainingBudget,
+      afterPurch: remainingBudgetAfter,
+    },
   };
 }
+
 // ================================================================
 // UI — tplSimular (nueva pantalla "¿Lo compro?")
 // ================================================================
@@ -1803,7 +1818,7 @@ function tplSimular() {
         <input type="number" step="1" min="0" id="simAmountInput" value="" placeholder="0"
           style="font-size:28px; font-weight:500; color:var(--teal); text-align:center; width:140px; border:none; padding:2px; margin-bottom:0;" />
       </div>
-      <input type="range" id="simSlider" min="0" max="${Math.max(disponible() * 2, 10000)}" step="100" value="0" style="width:100%; margin-bottom:0;" />
+      <input type="range" id="simSlider" min="0" max="${Math.max((state.analysis?.cashFlow?.monthlyIncome || 0) * 2, 10000)}" step="100" value="0" style="width:100%; margin-bottom:0;" />
     </div>
 
     <div id="decisionResult"></div>
@@ -1850,7 +1865,7 @@ function renderDecisionCard(analysis) {
   // P6: oportunidades ordenadas por impacto con estrellas
   const oppHtml = dimensions.oportunidad.items.length > 0
     ? `<div style="padding:10px 0;">
-         <p style="font-size:12px; font-weight:500; margin:0 0 8px;">💡 Con ${money(meta.amount)} también podrías:</p>
+         <p style="font-size:12px; font-weight:500; margin:0 0 8px;">💡 ${dimensions.oportunidad.title || `Con ${money(meta.amount)} también podrías:`}</p>
          ${dimensions.oportunidad.items.map(o => {
            const oStars = Array.from({length:5},(_,i) => `<span style="color:${i < o.stars ? 'var(--gold)' : 'var(--border)'}; font-size:12px;">★</span>`).join("");
            return `<div style="margin-bottom:8px;">
@@ -1909,7 +1924,7 @@ function wireSimulador() {
     amountInput.value = val || "";
 
     const itemName = document.getElementById("simItemName")?.value.trim() || "";
-    const analysis = buildPurchaseAnalysis(val, itemName);
+    const analysis = buildPurchaseAnalysis(state.analysis, val, itemName);
     if (val > 0) lastPurchaseAnalysis = analysis;
     resultEl.innerHTML = val > 0 ? renderDecisionCard(analysis) : "";
 
@@ -1973,14 +1988,14 @@ function wireDecisionActions(analysis) {
 function primaryGoal() {
   const order = { critical: 0, important: 1, optional: 2 };
   // Solo metas activas o en riesgo — las completadas no van al Dashboard
-  const activas = state.goals.filter(g => g.status !== "completed");
+  const activas = state.goals.filter(isGoalActive);
   return [...activas].sort((a, b) => (order[a.priority] ?? 3) - (order[b.priority] ?? 3))[0];
 }
 
 function tplInicio() {
   const g = primaryGoal();
   const progressPct = g ? Math.min(100, Math.round((Number(g.current_amount) / Number(g.target_amount)) * 100)) : 0;
-  const baseline = computeBaselineScore();
+  const baseline = state.analysis?.financialHealth?.score ?? null;
   return `
     <div class="top-bar">
       <div>
@@ -2022,7 +2037,7 @@ function tplInicio() {
         <p style="font-size:11px; color:var(--text-muted); margin:0 0 6px;">${money(g.current_amount)} de ${money(g.target_amount)} · ${goalMonthsLeft(g) > 0 ? "Faltan " + goalMonthsLeft(g) + " meses" : "Plazo cumplido"}</p>
         <div class="progress-bar"><div class="progress-fill" style="width:${progressPct}%;"></div></div>
       </div>
-      ${state.goals.filter(x => x.status !== "completed").length > 1 ? `<p style="font-size:11px; color:var(--text-muted); margin:-4px 0 10px; text-align:center;">+${state.goals.filter(x => x.status !== "completed").length - 1} meta${state.goals.filter(x => x.status !== "completed").length > 2 ? "s" : ""} más</p>` : ""}
+      ${state.goals.filter(isGoalActive).length > 1 ? `<p style="font-size:11px; color:var(--text-muted); margin:-4px 0 10px; text-align:center;">+${state.goals.filter(isGoalActive).length - 1} meta${state.goals.filter(isGoalActive).length > 2 ? "s" : ""} más</p>` : ""}
     ` : state.goals.length > 0 ? `
       <div class="card" style="background:var(--success-bg); text-align:center; padding:16px;">
         <p style="font-size:22px; margin:0 0 4px;">🎉</p>
@@ -2206,8 +2221,8 @@ function tplGastos() {
 }
 
 function tplMetas() {
-  const activas = state.goals.filter(g => g.status !== "completed");
-  const completadas = state.goals.filter(g => g.status === "completed");
+  const activas = state.goals.filter(isGoalActive);
+  const completadas = state.goals.filter(g => g.status === "completed" || Number(g.current_amount) >= Number(g.target_amount));
 
   function cardMeta(g, esCompletada = false) {
     const progressPct = Math.min(100, Math.round((Number(g.current_amount) / Number(g.target_amount)) * 100));
@@ -2374,7 +2389,7 @@ function tplPresupuestos() {
 
   const rowFijados = fijados.map(c => {
     const budget = state.budgets.find(b => b.category_id === c.id);
-    const spent = spentThisMonthByCategory(c.id);
+    const spent = Number(state.analysis?.spending?.byCategory?.[c.id]) || 0;
     const pct = Math.min(100, Math.round((spent / Number(budget.amount)) * 100));
     const overBudget = pct >= 100;
     return `
@@ -3243,7 +3258,7 @@ function openContributeModal(goalId) {
       const monthsEarly = goalMonthsLeft(g); // meses que quedaban cuando aportó
       const updatedGoal = state.goals.find(x => x.id === g.id);
       const monthlyPaceWas = goalMonthlyPace({ ...g, current_amount: 0 }); // aporte mensual que ya no se necesita
-      const nextActive = state.goals.find(x => x.status !== "completed" && x.id !== g.id);
+      const nextActive = state.goals.find(x => isGoalActive(x) && x.id !== g.id);
       openGoalCelebrationModal(g.name, monthsEarly, Math.round(monthlyPaceWas), nextActive);
     } else {
       renderApp();
