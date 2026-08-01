@@ -17,7 +17,7 @@
 <script type="module">
 import { supabase } from "./js/supabaseClient.js";
 
-const APP_BUILD = "financial-core-v2-audit-2026-08-01";
+const APP_BUILD = "financial-core-v2-corrected-2026-08-01";
 window.__APP_BUILD__ = APP_BUILD;
 console.info(`[Coach Financiero] build ${APP_BUILD}`);
 
@@ -258,6 +258,14 @@ function isDebtActive(d) {
   return d.status !== "completed" && Number(d.current_balance) > 0;
 }
 
+// Crea una fecha de cobro válida incluso en meses cortos.
+// Ejemplo: si el usuario cobra el día 30, febrero usa su último día real.
+function dateForMonthDay(year, monthIndex, day) {
+  const lastDay = new Date(year, monthIndex + 1, 0).getDate();
+  const requestedDay = Math.max(1, Number(day) || 1);
+  return new Date(year, monthIndex, Math.min(requestedDay, lastDay));
+}
+
 // Calcula días hasta el próximo cobro y la fecha estimada
 // basándose en pay_day_1, pay_day_2 y pay_frequency del perfil.
 function totalFixed() {
@@ -356,10 +364,10 @@ function buildFinancialData(asOf = new Date()) {
       : [raw.profile.pay_day_1];
     let next = null;
     for (const d of days) {
-      const c = new Date(y, m, d);
+      const c = dateForMonthDay(y, m, d);
       if (c > today) { next = c; break; }
     }
-    if (!next) next = new Date(y, m + 1, days[0]);
+    if (!next) next = dateForMonthDay(y, m + 1, days[0]);
     nextPayDate  = next.toLocaleDateString("es-DO", { day: "numeric", month: "long" });
     daysUntilPay = Math.ceil((next - today) / 86400000);
     nextPayAmount = perPaycheck;
@@ -521,17 +529,20 @@ function FinancialCore(fd, options = {}) {
     return s + Math.max(0, Number(g.target_amount) - Number(g.current_amount)) / rem;
   }, 0);
 
+  const canAffordAllGoals = n.dispRestante >= totalPace;
   const goals = {
     active: activeGoals, completed: completedGoals,
     totalMonthlyPace: Math.round(totalPace),
-    canAffordAllGoals: n.dispRestante >= totalPace,
+    canAffordAllGoals,
     byGoal: activeGoals.map(g => {
       const created = new Date(g.created_at);
       const elapsed = (now.getFullYear() - created.getFullYear()) * 12 + (now.getMonth() - created.getMonth());
       const rem     = Math.max(1, g.target_months - elapsed);
       const toSave  = Math.max(0, Number(g.target_amount) - Number(g.current_amount));
       const pace    = Math.round(toSave / rem);
-      const st      = toSave <= 0 ? "completed" : pace > n.dispRestante ? "at_risk" : "active";
+      const st      = toSave <= 0
+        ? "completed"
+        : (!canAffordAllGoals || pace > n.dispRestante) ? "at_risk" : "active";
       return { ...g, pace, monthsLeft: rem, derivedStatus: st };
     }),
   };
@@ -637,8 +648,13 @@ function RecommendationEngine(analysis) {
     });
   }
 
-  // Fondo de emergencia faltante
-  const hasEmergencyFund = goals.active.some(g => g.name.toLowerCase().includes("emergencia"));
+  // Fondo de emergencia faltante. Una meta completada también cuenta
+  // mientras conserve un monto registrado, para no recomendar crearla de nuevo.
+  const emergencyGoals = [...goals.active, ...goals.completed]
+    .filter(g => (g.name || "").toLowerCase().includes("emergencia"));
+  const hasEmergencyFund = emergencyGoals.some(g =>
+    g.status === "completed" || Number(g.current_amount) > 0
+  );
   if (!hasEmergencyFund && n.availableToday < n.monthlyIncome) {
     priorities.push({
       id: "emergency_fund", category: "saving",
@@ -817,7 +833,8 @@ function runEngineTests() {
 
   // Caso 4: quincenal → ingreso mensual normalizado
   const stateBackup = { ...state };
-  state = { ...state, profile: { pay_frequency: "biweekly", declared_monthly_income: 17000, pay_day_1: 15, pay_day_2: 30 }, account: { computed_balance: 5000 }, transactions: [], goals: [], fixed: [], debts: [], budgets: [] };
+  const categoriesBackup = [...categories];
+  state = { ...state, profile: { pay_frequency: "biweekly", declared_monthly_income: 17000, pay_day_1: 15, pay_day_2: 30 }, account: { computed_balance: 5000 }, transactions: [], analysisTransactions: [], goals: [], fixed: [], debts: [], budgets: [] };
   const fd4 = buildFinancialData();
   assert("Caso 4: quincenal 17000 → mensual 34000", fd4.normalized?.monthlyIncome === 34000);
   assert("Caso 4: income diario correcto", fd4.normalized?.dailyIncome === 1133);
@@ -831,7 +848,7 @@ function runEngineTests() {
   state = { ...stateBackup, profile: { pay_frequency: "monthly", declared_monthly_income: 20000 },
     account: { computed_balance: -500 },
     debts: [{ current_balance: 10000, interest_rate: 40, minimum_payment: 2000, debt_type: "lender" }],
-    goals: [], fixed: [], transactions: [], budgets: [] };
+    goals: [], fixed: [], transactions: [], analysisTransactions: [], budgets: [] };
   const fd6 = buildFinancialData();
   const a6 = FinancialCore(fd6);
   assert("Caso 6: saldo negativo + deuda → stage survival", a6.stage === "survival");
@@ -884,8 +901,99 @@ function runEngineTests() {
   const p10 = buildPurchaseAnalysis(state.analysis, 100, "tenis");
   assert("Caso 10: deuda >=30% impide verde", p10.verdict !== "green");
 
-  // Restaurar state real
+  // Caso 11: saldo proyectado y dinero libre proyectado son conceptos distintos
+  assert("Caso 11: saldo tras compra proyectada = RD$16,190", p8.affordability.balanceAfterProjected === 16190);
+  assert("Caso 11: dinero libre proyectado tras compromisos = RD$12,190", p8.affordability.freeCashAfterProjected === 12190);
+
+  // Caso 12: una meta pausada no compite con el presupuesto actual
+  state = {
+    ...stateBackup,
+    profile: { pay_frequency: "monthly", declared_monthly_income: 30000, pay_day_1: 30 },
+    account: { computed_balance: 15000 },
+    fixed: [], debts: [], transactions: [], analysisTransactions: [], budgets: [],
+    goals: [
+      { id: "active-goal", name: "Emergencia", status: "active", created_at: "2026-08-01T00:00:00Z", target_months: 6, target_amount: 3000, current_amount: 0 },
+      { id: "paused-goal", name: "Vehículo", status: "paused", created_at: "2026-08-01T00:00:00Z", target_months: 2, target_amount: 100000, current_amount: 0 },
+    ],
+  };
+  const core12 = FinancialCore(buildFinancialData(fixedDate), { asOf: fixedDate });
+  assert("Caso 12: meta pausada excluida", core12.goals.active.length === 1 && core12.goals.active[0].id === "active-goal");
+  assert("Caso 12: compromiso mensual solo incluye meta activa", core12.goals.totalMonthlyPace === 500);
+
+  // Caso 13: una deuda completada no afecta riesgo ni recomendaciones
+  state = {
+    ...state,
+    debts: [{ id: "paid-debt", name: "Tarjeta cerrada", status: "completed", current_balance: 0, interest_rate: 60, minimum_payment: 2000 }],
+  };
+  const core13 = FinancialCore(buildFinancialData(fixedDate), { asOf: fixedDate });
+  assert("Caso 13: deuda completada excluida", core13.debts.count === 0 && core13.debts.riskLevel === "none");
+
+  // Caso 14: ingreso mensual no se duplica y el próximo cobro mensual conserva el monto
+  state = {
+    ...stateBackup,
+    profile: { pay_frequency: "monthly", declared_monthly_income: 40000, pay_day_1: 30 },
+    account: { computed_balance: 10000 }, goals: [], debts: [], fixed: [],
+    transactions: [], analysisTransactions: [], budgets: [],
+  };
+  const core14 = FinancialCore(buildFinancialData(fixedDate), { asOf: fixedDate });
+  assert("Caso 14: ingreso mensual permanece RD$40,000", core14.cashFlow.monthlyIncome === 40000);
+  assert("Caso 14: próximo cobro mensual es RD$40,000", core14.liquidity.nextPay?.amount === 40000);
+
+  // Caso 15: aportes y pagos reducen saldo, pero no son gasto variable
+  state = {
+    ...stateBackup,
+    profile: { pay_frequency: "monthly", declared_monthly_income: 30000, pay_day_1: 30 },
+    account: { computed_balance: 15500 }, goals: [], debts: [], fixed: [], budgets: [],
+    transactions: [],
+    analysisTransactions: [
+      { amount: -1000, category_id: "food", note: "Compra", occurred_at: "2026-08-01T12:00:00Z" },
+      { amount: -2000, category_id: null, note: "Aporte: Fondo de emergencia", occurred_at: "2026-08-01T12:00:00Z" },
+      { amount: -1500, category_id: null, note: "Pago: Tarjeta", occurred_at: "2026-08-01T12:00:00Z" },
+    ],
+  };
+  categories = [{ id: "food", name: "Comida" }];
+  const core15 = FinancialCore(buildFinancialData(fixedDate), { asOf: fixedDate });
+  assert("Caso 15: gasto variable solo cuenta consumo real", core15.spending.thisMonth === 1000);
+
+  // Caso 16: gasto por categoría usa el mismo cálculo del Core
+  state.analysisTransactions = [
+    { amount: -2000, category_id: "food", note: "Comida 1", occurred_at: "2026-08-01T12:00:00Z" },
+    { amount: -1500, category_id: "food", note: "Comida 2", occurred_at: "2026-08-01T12:00:00Z" },
+  ];
+  const core16 = FinancialCore(buildFinancialData(fixedDate), { asOf: fixedDate });
+  assert("Caso 16: Comida acumula RD$3,500", core16.spending.byCategory.food === 3500);
+
+  // Caso 17: metas en riesgo impiden un veredicto verde
+  state = {
+    ...stateBackup,
+    profile: { pay_frequency: "monthly", declared_monthly_income: 10000, pay_day_1: 30 },
+    account: { computed_balance: 10000 }, debts: [], fixed: [{ estimated_amount: 9000 }],
+    transactions: [], analysisTransactions: [], budgets: [],
+    goals: [{ id: "risky", name: "Meta exigente", status: "active", created_at: "2026-08-01T00:00:00Z", target_months: 1, target_amount: 5000, current_amount: 0 }],
+  };
+  const core17 = FinancialCore(buildFinancialData(fixedDate), { asOf: fixedDate });
+  state.analysis = { ...core17, recommendations: RecommendationEngine(core17) };
+  const p17 = buildPurchaseAnalysis(state.analysis, 100, "compra pequeña");
+  assert("Caso 17: meta en riesgo impide verde", p17.verdict !== "green");
+
+  // Caso 18: si el saldo futuro cubre la compra pero no los compromisos,
+  // la app no afirma que sea una compra saludable.
+  state = {
+    ...stateBackup,
+    profile: { pay_frequency: "biweekly", declared_monthly_income: 17000, pay_day_1: 15, pay_day_2: 30 },
+    account: { computed_balance: -800 }, fixed: [], debts: [], transactions: [], analysisTransactions: [], budgets: [],
+    goals: [{ id: "big-goal", name: "Meta grande", status: "active", created_at: "2026-08-01T00:00:00Z", target_months: 1, target_amount: 17000, current_amount: 0 }],
+  };
+  const core18 = FinancialCore(buildFinancialData(fixedDate), { asOf: fixedDate });
+  state.analysis = { ...core18, recommendations: RecommendationEngine(core18) };
+  const p18 = buildPurchaseAnalysis(state.analysis, 100, "tenis");
+  assert("Caso 18: saldo futuro cubre compra", p18.affordability.canBuyAfterNextIncome === true);
+  assert("Caso 18: compromisos futuros no quedan cubiertos", p18.affordability.freeCashAfterProjected < 0);
+  assert("Caso 18: mensaje reconoce que compromete el plan", p18.verdictLabel.includes("compromete tu plan"));
+
+  // Restaurar estado y categorías reales
   state = stateBackup;
+  categories = categoriesBackup;
   if (state.profile && state.account) computeAnalysis();
 
   const passed = results.filter(r => r.ok).length;
@@ -900,6 +1008,7 @@ function runEngineTests() {
 
 // Las funciones de un script type=module no quedan globales automáticamente.
 window.runEngineTests = runEngineTests;
+window.runScenarioTests = runEngineTests;
 
 function determineStep() {
   if (!state.account) return "account";
@@ -1561,12 +1670,24 @@ function buildPurchaseAnalysis(financialAnalysis, amount, itemName) {
   const remainingBudgetAfter = Number(cashFlow.remainingBudget || 0) - purchaseAmount;
   const operatingSurplusAfter = Number(cashFlow.operatingSurplus || 0) - purchaseAmount;
 
+  // Faltantes separados: capacidad matemática de pagar vs. capacidad de
+  // preservar compromisos. Nunca mezclar saldo proyectado con dinero libre.
+  const purchaseShortfallToday = Math.max(0, purchaseAmount - bal);
+  const purchaseShortfallProjected = projectedBalance == null
+    ? purchaseAmount
+    : Math.max(0, purchaseAmount - projectedBalance);
+  const freeCashShortfallToday = Math.max(0, -freeCashAfterToday);
+  const freeCashShortfallProjected = freeCashAfterProjected == null
+    ? null
+    : Math.max(0, -freeCashAfterProjected);
+
   const canBuyToday = purchaseAmount > 0 && bal >= purchaseAmount;
   const canBuyAfterNextIncome = purchaseAmount > 0 && !canBuyToday && projectedBalance !== null && projectedBalance >= purchaseAmount;
   const criticalDebt = debts?.riskLevel === "critical";
   const goalsAtRisk = (goals?.byGoal || []).some(g => g.derivedStatus === "at_risk");
   const commitmentsCoveredToday = freeCashAfterToday >= 0;
   const commitmentsCoveredProjected = freeCashAfterProjected !== null && freeCashAfterProjected >= 0;
+  const goalsCovered = goals?.canAffordAllGoals !== false && !goalsAtRisk;
 
   // 1. LIQUIDEZ
   let liqS, liqLabel, liqMsg;
@@ -1584,7 +1705,10 @@ function buildPurchaseAnalysis(financialAnalysis, amount, itemName) {
   } else if (canBuyAfterNextIncome) {
     liqS = commitmentsCoveredProjected ? (nextPay?.daysAway <= 5 ? 55 : nextPay?.daysAway <= 15 ? 45 : 35) : 25;
     liqLabel = scoreLabel(liqS);
-    liqMsg = `Hoy no tienes ${money(purchaseAmount)} en cuenta (saldo: ${money(bal)}). Después de tu próximo cobro de ${money(nextPay?.amount || 0)} tendrías ${money(projectedBalance)} y, tras la compra, ${money(balanceAfterProjected)}. ${commitmentsCoveredProjected ? "La compra sería posible entonces, no hoy." : "El saldo cubriría la compra, pero tus compromisos planificados quedarían sin cubrir."}`;
+    const projectedFreeText = freeCashAfterProjected == null
+      ? "sin cálculo de dinero libre"
+      : `${money(Math.round(freeCashAfterProjected))} libres después de compromisos`;
+    liqMsg = `Hoy no tienes ${money(purchaseAmount)} en cuenta (saldo: ${money(bal)}). Después de tu próximo cobro de ${money(nextPay?.amount || 0)} el saldo sería ${money(projectedBalance)}; tras la compra quedarían ${money(balanceAfterProjected)} en cuenta y ${projectedFreeText}. ${commitmentsCoveredProjected ? "La compra sería posible entonces, no hoy." : "El saldo alcanzaría, pero tus compromisos planificados quedarían sin cubrir."}`;
   } else {
     liqS = 5; liqLabel = "Muy baja";
     if (nextPay) {
@@ -1664,7 +1788,7 @@ function buildPurchaseAnalysis(financialAnalysis, amount, itemName) {
     liqS * 0.35 + debtS * 0.20 + goalsS * 0.25 + habitsS * 0.10 + wellS * 0.10;
   const score = Math.round(rawScore);
 
-  const shouldBuy = canBuyToday && commitmentsCoveredToday && remainingBudgetAfter >= 0 && !criticalDebt;
+  const shouldBuy = canBuyToday && commitmentsCoveredToday && remainingBudgetAfter >= 0 && goalsCovered && !criticalDebt;
   const strategicPriority = recommendations?.nextBestAction || null;
   const isBestUseOfMoney = shouldBuy && (!strategicPriority || Number(strategicPriority.impact || 0) < 90);
 
@@ -1684,13 +1808,28 @@ function buildPurchaseAnalysis(financialAnalysis, amount, itemName) {
     verdictLabel = "🟢 Compra recomendable";
     reason = `Puedes pagarla hoy, tus compromisos quedan cubiertos y no existe una prioridad financiera más urgente.`;
   } else if (!canBuyToday && canBuyAfterNextIncome) {
-    verdictLabel = "🟡 Viable cuando cobres";
-    reason = `Hoy tienes ${money(bal)}. Después de tu próximo cobro de ${money(nextPay?.amount || 0)} tendrías ${money(projectedBalance || 0)} y podrías pagar ${money(purchaseAmount)}. Espera a recibir el dinero; hoy no está disponible.`;
+    if (criticalDebt) {
+      verdictLabel = "🟡 Viable cuando cobres, pero la deuda es prioritaria";
+      reason = `El saldo proyectado cubriría ${money(purchaseAmount)} después del próximo cobro, pero tienes una deuda al ${topDebt?.interest_rate}% anual. Espera a recibir el dinero y prioriza reducir esa deuda.`;
+    } else if (!commitmentsCoveredProjected || remainingBudgetAfter < 0 || !goalsCovered) {
+      verdictLabel = "🟡 El saldo alcanzaría cuando cobres, pero compromete tu plan";
+      const uncovered = Math.max(
+        0,
+        Number(freeCashShortfallProjected || 0),
+        Math.max(0, -remainingBudgetAfter)
+      );
+      reason = `Hoy no puedes pagarla. Después del próximo cobro el saldo proyectado sería ${money(projectedBalance || 0)} y quedaría ${money(balanceAfterProjected || 0)} tras la compra, pero faltarían ${money(Math.round(uncovered))} para mantener cubiertos tus compromisos o presupuesto mensual.`;
+    } else {
+      verdictLabel = "🟡 Viable cuando cobres";
+      reason = `Hoy tienes ${money(bal)}. Después de tu próximo cobro de ${money(nextPay?.amount || 0)} tendrías ${money(projectedBalance || 0)}; tras pagar ${money(purchaseAmount)} quedarían ${money(balanceAfterProjected || 0)} en la cuenta y ${money(freeCashAfterProjected || 0)} libres después de compromisos. Espera a recibir el dinero; hoy no está disponible.`;
+    }
   } else if (!canBuyToday) {
     verdictLabel = "🔴 No alcanza";
     if (nextPay) {
-      const faltante = Math.max(0, purchaseAmount - Number(projectedBalance || 0));
-      reason = `Hoy tienes ${money(bal)}. Después de tu próximo cobro tendrías ${money(projectedBalance || 0)} y aún faltarían ${money(faltante)}.`;
+      const extraCommitmentText = freeCashShortfallProjected && freeCashShortfallProjected > purchaseShortfallProjected
+        ? ` Para preservar compromisos, el faltante financiero sería ${money(freeCashShortfallProjected)}.`
+        : "";
+      reason = `Hoy tienes ${money(bal)}. Después de tu próximo cobro tendrías ${money(projectedBalance || 0)} y aún faltarían ${money(purchaseShortfallProjected)} para efectuar la compra.${extraCommitmentText}`;
     } else {
       reason = `Hoy tienes ${money(bal)} y no hay un próximo cobro configurado que permita cubrir la compra.`;
     }
@@ -1723,7 +1862,8 @@ function buildPurchaseAnalysis(financialAnalysis, amount, itemName) {
     const fixedExpenses = Number(cashFlow.fixedExpenses) || 0;
     if (fixedExpenses > 0) {
       const emergencyTarget = fixedExpenses * 3;
-      const emergencyGoal = (goals?.active || []).find(g => g.name?.toLowerCase().includes("emergencia"));
+      const emergencyGoal = [...(goals?.active || []), ...(goals?.completed || [])]
+        .find(g => g.name?.toLowerCase().includes("emergencia"));
       const emergencySaved = emergencyGoal ? Number(emergencyGoal.current_amount) || 0 : 0;
       if (emergencySaved < emergencyTarget) {
         opportunityItems.push({ stars: 3, text: "Fortalecer tu fondo de emergencia", reason: `Meta de referencia: ${money(emergencyTarget)}. Has registrado ${money(emergencySaved)} en una meta de emergencia.` });
@@ -1746,7 +1886,18 @@ function buildPurchaseAnalysis(financialAnalysis, amount, itemName) {
     verdictLabel,
     reason,
     score,
-    affordability: { canBuyNow: canBuyToday, canBuyAfterNextIncome },
+    affordability: {
+      canBuyNow: canBuyToday,
+      canBuyAfterNextIncome,
+      balanceAfterToday,
+      balanceAfterProjected,
+      freeCashAfterToday,
+      freeCashAfterProjected,
+      purchaseShortfallToday,
+      purchaseShortfallProjected,
+      freeCashShortfallToday,
+      freeCashShortfallProjected,
+    },
     judgment: { shouldBuy, isBestUseOfMoney },
     dimensions: {
       liquidez: { score: liqS, msg: liqMsg },
@@ -1772,6 +1923,10 @@ function buildPurchaseAnalysis(financialAnalysis, amount, itemName) {
       balanceAfterProjected,
       freeCashAfterToday,
       freeCashAfterProjected,
+      purchaseShortfallToday,
+      purchaseShortfallProjected,
+      freeCashShortfallToday,
+      freeCashShortfallProjected,
     },
     judgment: {
       shouldBuy,
