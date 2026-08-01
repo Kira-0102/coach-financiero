@@ -1673,9 +1673,12 @@ async function sendCoachMessage() {
   // Contexto conversacional de compra: si el chat resolvió item+monto
   // (por ejemplo "quiero comprar tenis" → "1000 pesos"), invoca el MISMO
   // motor que usa ¿Lo compro? — el chat nunca calcula por su cuenta.
+  // IMPORTANTE: capturar awaitingAmount ANTES de actualizar el contexto,
+  // porque updateCoachPurchaseContext lo pone en false al resolver el monto.
+  const wasAwaitingAmount = coachPurchaseContext.awaitingAmount;
   updateCoachPurchaseContext(msg);
   const purchaseRelated = containsPurchaseIntent(msg) || isPurchaseFollowUpMsg(msg) ||
-    (coachPurchaseContext.awaitingAmount && isAmountOnlyReply(msg));
+    (wasAwaitingAmount && isAmountOnlyReply(msg));
   const hasResolvedChatPurchase = Number(coachPurchaseContext.amount) > 0;
   if (purchaseRelated && hasResolvedChatPurchase && state.analysis) {
     lastPurchaseAnalysis = buildPurchaseAnalysis(
