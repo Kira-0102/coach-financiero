@@ -1356,11 +1356,20 @@ function buildCoachContext() {
     budgetSummary,
     debtsSummary,
     structured,
+    // Último análisis de ¿Lo compro? — para que el coach no contradiga el veredicto
+    lastPurchaseVerdict: lastPurchaseAnalysis ? {
+      verdict: lastPurchaseAnalysis.verdict,
+      verdictLabel: lastPurchaseAnalysis.verdictLabel,
+      reason: lastPurchaseAnalysis.reason,
+      item: lastPurchaseAnalysis.meta?.itemName ?? null,
+      amount: lastPurchaseAnalysis.meta?.amount ?? null,
+    } : null,
   };
 }
 
 let coachError = "";
 let coachSending = false;
+let lastPurchaseAnalysis = null;
 
 async function sendCoachMessage() {
   if (coachSending) return; // evita envíos duplicados por doble Enter/clic
@@ -1467,9 +1476,13 @@ function buildPurchaseAnalysis(amount, itemName) {
       liqMsg = `Hoy tienes ${money(bal)}, pero cobras en ${nextPay.dias} día${nextPay.dias > 1 ? "s" : ""} (${money(nextPay.monto)}). Con ese cobro tendrías ${money(balProyectado)} — suficiente.`;
     } else {
       liqS = 5; liqLabel = "Muy baja";
-      liqMsg = bigGap
-        ? `Hoy no tienes ${money(amount)} en cuenta (tienes ${money(bal)}). Parece que tu ingreso de este período aún no ha entrado.`
-        : `Hoy no tienes ${money(amount)} en cuenta (tienes ${money(bal)}). No podrías pagar esto ahora mismo.`;
+      if (nextPay && nextPay.dias > 0) {
+        liqMsg = `Hoy no tienes ${money(amount)} en cuenta (tienes ${money(bal)}). Tu próximo cobro es en ${nextPay.dias} día${nextPay.dias > 1 ? "s" : ""} por ${money(nextPay.monto)}.`;
+      } else if (bigGap) {
+        liqMsg = `Hoy no tienes ${money(amount)} en cuenta (tienes ${money(bal)}). Parece que tu ingreso de este período aún no ha entrado.`;
+      } else {
+        liqMsg = `Hoy no tienes ${money(amount)} en cuenta (tienes ${money(bal)}).`;
+      }
     }
   } else {
     // Sí alcanza con el saldo efectivo
@@ -1603,9 +1616,13 @@ function buildPurchaseAnalysis(amount, itemName) {
     reason = `Puedes hacer la compra, pero te quedaría menos margen para el resto del mes. Revisa si puedes recortar algún gasto variable.`;
   } else if (verdict === "red" && balEfectivo < amount) {
     verdictLabel = "🔴 No alcanza";
-    reason = bal < amount && !cobrarPronto
-      ? `Hoy tienes ${money(bal)} en cuenta y no hay un cobro próximo que lo cubra.`
-      : `Incluso con tu próximo cobro, el saldo proyectado (${money(balProyectado)}) no alcanza para ${money(amount)}.`;
+    if (bal < amount && nextPay && nextPay.dias > 0 && !cobrarPronto) {
+      reason = `Hoy tienes ${money(bal)} en cuenta. Tu próximo cobro es en ${nextPay.dias} días por ${money(nextPay.monto)}, pero incluso con ese cobro no alcanzaría para ${money(amount)}.`;
+    } else if (bal < amount && nextPay && cobrarPronto) {
+      reason = `Incluso con tu próximo cobro (${money(nextPay.monto)} en ${nextPay.dias} días), el saldo proyectado de ${money(balProyectado)} no alcanza para ${money(amount)}.`;
+    } else {
+      reason = `Hoy tienes ${money(bal)} en cuenta.${nextPay ? ` Tu próximo cobro es en ${nextPay.dias} días.` : ""}`;
+    }
   } else {
     verdictLabel = "🔴 No recomendable ahora";
     reason = `Esta compra compromete tu liquidez o tus compromisos financieros actuales.`;
@@ -1758,10 +1775,12 @@ function renderDecisionCard(analysis) {
       ${starsHtml ? `<div style="margin-bottom:6px;">${starsHtml}</div>` : ""}
       <p style="font-size:16px; font-weight:600; color:${verdictColor}; margin:0 0 10px;">${verdictLabel}</p>
       <p style="font-size:13px; color:${verdictColor}; margin:0 0 12px; opacity:0.9; line-height:1.6;">${reason}</p>
+      ${verdict !== "red" ? `
       <div style="display:inline-flex; align-items:center; gap:6px; background:rgba(255,255,255,0.4); border-radius:20px; padding:4px 12px;">
         <span style="font-size:13px; font-weight:600; color:${verdictColor};">Score ${score}/100</span>
         <span style="font-size:11px; color:${verdictColor}; opacity:0.8;">· Confianza ${score >= 70 ? "Alta" : score >= 45 ? "Media" : "Baja"}</span>
       </div>
+      ` : ""}
     </div>
 
     <div class="card" style="margin-bottom:10px; padding:0 12px;">
@@ -1797,6 +1816,7 @@ function wireSimulador() {
 
     const itemName = document.getElementById("simItemName")?.value.trim() || "";
     const analysis = buildPurchaseAnalysis(val, itemName);
+    if (val > 0) lastPurchaseAnalysis = analysis;
     resultEl.innerHTML = val > 0 ? renderDecisionCard(analysis) : "";
 
     if (val > 0) wireDecisionActions(analysis);
