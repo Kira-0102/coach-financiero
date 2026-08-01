@@ -344,7 +344,7 @@ function computeBaselineScore() {
 
 // ================================================================
 // ================================================================
-// FINANCIAL ENGINE — FASE 1 (v2)
+// FINANCIAL CORE — FASE 1 (v2)
 // Arquitectura en 5 capas con responsabilidades separadas.
 //
 // REGLAS DE ORO (ningún código nuevo puede violarlas):
@@ -362,7 +362,7 @@ function computeBaselineScore() {
 //   CoachContextBuilder → contexto para la IA (Fase 5)
 //   DashboardPresenter → modelo para la UI (Fase 4)
 //
-// SCHEMA VERSION: 1
+// SCHEMA VERSION: 2
 // Incrementar cuando cambie la estructura de FinancialAnalysis
 // para que módulos que consumen el análisis puedan verificar.
 // ================================================================
@@ -435,18 +435,21 @@ function buildFinancialData(asOf = new Date()) {
     return true;
   }).reduce((s, t) => s + Math.abs(Number(t.amount)), 0);
 
-  // Gastos del mes agrupados por categoría 
-  const spendingByCategory = {}; 
-  for (const category of raw.categories) { 
-    spendingByCategory[category.id] = 0; 
-  } 
-  for (const transaction of txMonth) { 
-    const amount = Number(transaction.amount); 
-    if (amount >= 0) continue; 
-    if (!transaction.category_id) continue; 
-    spendingByCategory[transaction.category_id] = 
-    (spendingByCategory[transaction.category_id] || 0) + 
-    Math.abs(amount); 
+  // Gastos del mes agrupados por categoría.
+  const spendingByCategory = {};
+
+  for (const category of raw.categories) {
+    spendingByCategory[category.id] = 0;
+  }
+
+  for (const transaction of txMonth) {
+    const amount = Number(transaction.amount);
+    if (amount >= 0) continue;
+    if (!transaction.category_id) continue;
+
+    spendingByCategory[transaction.category_id] =
+      (spendingByCategory[transaction.category_id] || 0) +
+      Math.abs(amount);
   }
 
   const monthlyFixed = raw.fixed.reduce((s, f) => s + Number(f.estimated_amount), 0);
@@ -503,19 +506,60 @@ function FinancialCore(fd, options = {}) {
 
   const n = fd.normalized, raw = fd.raw;
 
-  // DOMINIO: cashFlow
-  const cashFlow = {
-    availableToday:    n.availableToday,
-    availableMonthly:  n.dispRestante,
-    freeCashToday:     n.freeCashToday,
+  // DOMINIO: liquidity
+  // Describe el dinero disponible hoy y el dinero proyectado.
+  const liquidity = {
+    balanceToday: n.availableToday,
+
+    projectedBalance: n.nextPayAmount !== null
+      ? n.availableToday + n.nextPayAmount
+      : null,
+
+    plannedCommitments: n.committed,
+    freeCashToday: n.freeCashToday,
     freeCashProjected: n.freeCashProjected,
-    committed:         n.committed,
-    dailyRate:         n.dailyRate,
-    daysLeft:          n.daysLeft,
-    nextPay: n.nextPayDate ? {
-      amount: n.nextPayAmount, date: n.nextPayDate, daysAway: n.daysUntilPay,
-      summary: `en ${n.daysUntilPay} día${n.daysUntilPay !== 1 ? "s" : ""} (${n.nextPayDate}) por ${money(n.nextPayAmount)}`,
-    } : null,
+    dailyLiquidity: n.dailyRate,
+    daysLeftInMonth: n.daysLeft,
+
+    nextPay: n.nextPayDate
+      ? {
+          amount: n.nextPayAmount,
+          date: n.nextPayDate,
+          daysAway: n.daysUntilPay,
+          summary: `en ${n.daysUntilPay} día${n.daysUntilPay !== 1 ? "s" : ""} (${n.nextPayDate}) por ${money(n.nextPayAmount)}`,
+        }
+      : null,
+  };
+
+  // DOMINIO: cashFlow
+  // Describe ingresos, gastos y margen mensual.
+  const operatingExpenses = n.monthlyFixed + n.spentThisMonth;
+  const operatingSurplus = n.monthlyIncome - operatingExpenses;
+  const remainingBudget = operatingSurplus - n.committed;
+
+  const cashFlow = {
+    monthlyIncome: n.monthlyIncome,
+    fixedExpenses: n.monthlyFixed,
+    variableExpenses: n.spentThisMonth,
+    operatingExpenses: Math.round(operatingExpenses),
+    operatingSurplus: Math.round(operatingSurplus),
+    plannedCommitments: n.committed,
+    remainingBudget: Math.round(remainingBudget),
+
+    burnRate: n.monthlyIncome > 0
+      ? Number((operatingExpenses / n.monthlyIncome).toFixed(4))
+      : 0,
+
+    // Compatibilidad temporal con las pantallas antiguas.
+    // Estos campos se eliminarán cuando migremos toda la interfaz.
+    availableToday: liquidity.balanceToday,
+    availableMonthly: n.dispRestante,
+    freeCashToday: liquidity.freeCashToday,
+    freeCashProjected: liquidity.freeCashProjected,
+    committed: liquidity.plannedCommitments,
+    dailyRate: liquidity.dailyLiquidity,
+    daysLeft: liquidity.daysLeftInMonth,
+    nextPay: liquidity.nextPay,
   };
 
   // DOMINIO: spending
@@ -610,11 +654,14 @@ function FinancialCore(fd, options = {}) {
 
   return {
     schemaVersion: FA_SCHEMA_VERSION,
-    generatedAt:   new Date(),
+    generatedAt: new Date(asOf),
     stage,
-    // Dominios (solo describen realidad — sin decisiones ni recomendaciones)
-    cashFlow, spending, goals, debts, financialHealth,
-    // Datos normalizados — disponibles para RecommendationEngine, PurchaseEngine, etc.
+    liquidity,
+    cashFlow,
+    spending,
+    goals,
+    debts,
+    financialHealth,
     normalized: n,
   };
 }
@@ -712,14 +759,44 @@ const FinancialAnalysis = {
   empty(raw) {
     return {
       schemaVersion: FA_SCHEMA_VERSION,
-      generatedAt:   new Date(),
-      stage:         "onboarding",
-      cashFlow:      null, spending: null,
-      goals:         { active: [], completed: [], totalMonthlyPace: 0, canAffordAllGoals: false, byGoal: [] },
-      debts:         { total: 0, count: 0, riskLevel: "none", sorted: [], monthlyCommitment: 0 },
-      financialHealth: { score: null, stage: "onboarding", stageLabel: "Configurando", components: {}, weights: {} },
-      normalized:    null,
-      recommendations: { priorities: [], nextBestAction: null, headline: "Completa tu perfil para comenzar." },
+      generatedAt: new Date(),
+      stage: "onboarding",
+
+      liquidity: null,
+      cashFlow: null,
+      spending: null,
+
+      goals: {
+        active: [],
+        completed: [],
+        totalMonthlyPace: 0,
+        canAffordAllGoals: false,
+        byGoal: [],
+      },
+
+      debts: {
+        total: 0,
+        count: 0,
+        riskLevel: "none",
+        sorted: [],
+        monthlyCommitment: 0,
+      },
+
+      financialHealth: {
+        score: null,
+        stage: "onboarding",
+        stageLabel: "Configurando",
+        components: {},
+        weights: {},
+      },
+
+      normalized: null,
+
+      recommendations: {
+        priorities: [],
+        nextBestAction: null,
+        headline: "Completa tu perfil para comenzar.",
+      },
     };
   },
 };
@@ -765,6 +842,16 @@ function runEngineTests() {
   // Simulaciones con datos ficticios
   function mockAnalysis(overrides = {}) {
     const base = {
+      liquidity: {
+        balanceToday: 5000,
+        projectedBalance: 15000,
+        plannedCommitments: 2000,
+        freeCashToday: 3000,
+        freeCashProjected: 13000,
+        dailyLiquidity: 250,
+        daysLeftInMonth: 20,
+        nextPay: { amount: 10000, date: "15 de agosto", daysAway: 10 },
+      },
       cashFlow: { availableToday: 5000, freeCashToday: 3000, freeCashProjected: 20000 },
       spending: { thisMonth: 500, fixed: 300 },
       goals: { active: [], completed: [], totalMonthlyPace: 0, canAffordAllGoals: true, byGoal: [] },
@@ -811,7 +898,7 @@ function runEngineTests() {
     account: { computed_balance: 15000 },
     debts: [], goals: [], fixed: [], transactions: [], budgets: [] };
   const fd7 = buildFinancialData();
-  const a7 = FinancialEngine(fd7);
+  const a7 = FinancialCore(fd7);
   assert("Caso 7: saldo positivo sin deudas → stability/building", ["stability","building","growth"].includes(a7.stage));
 
   // Restaurar state real
