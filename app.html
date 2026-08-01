@@ -283,7 +283,7 @@ function nextPayInfo() {
 
   const diffMs = nextDate - today;
   const diffDays = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
-  const amount = Math.round(monthlyIncome() / (p.pay_frequency === "biweekly" ? 1 : 1));
+  const amount = Math.round(monthlyIncome() / (p.pay_frequency === "biweekly" ? 2 : 1));
 
   return {
     dias: diffDays,
@@ -1549,15 +1549,20 @@ function buildPurchaseAnalysis(amount, itemName) {
   // probablemente la quincena/sueldo aún no ha caído.
   const bigGap = dispRest - bal > Math.max(dispRest * 0.3, 500) && dispRest > 0;
 
-  // BUG 1+2 FIX: calcular saldo proyectado con próximo cobro
+  // Próximo cobro: se usa para determinar si la compra será posible después,
+  // independientemente de si faltan 5, 14 o más días. La cercanía del cobro
+  // solo afecta el mensaje y la puntuación, nunca la matemática.
   const nextPay = nextPayInfo();
-  const cobrarPronto = nextPay !== null && nextPay.dias <= 5;
-  const balProyectado = cobrarPronto ? bal + nextPay.monto : bal;
+  const hasNextPay = nextPay !== null && nextPay.dias > 0;
+  const cobrarPronto = hasNextPay && nextPay.dias <= 5;
+  const balProyectado = hasNextPay ? bal + nextPay.monto : bal;
   const balAfterProyectado = balProyectado - amount;
+  const canBuyToday = bal >= amount;
+  const canBuyAfterNextPay = !canBuyToday && hasNextPay && balProyectado >= amount;
 
-  // Para el análisis de liquidez, usar el saldo más favorable:
-  // si cobra en ≤5 días, evaluar con el saldo proyectado post-cobro.
-  const balEfectivo = cobrarPronto ? balProyectado : bal;
+  // Saldo de referencia para dimensiones posteriores. Nunca convierte una
+  // compra futura en una compra disponible hoy; el veredicto lo distingue.
+  const balEfectivo = canBuyToday ? bal : (canBuyAfterNextPay ? balProyectado : bal);
   const balAfterEfectivo = balEfectivo - amount;
 
   // BUG 4 FIX: si el saldo real es negativo, el dispRest planeado
@@ -1569,34 +1574,25 @@ function buildPurchaseAnalysis(amount, itemName) {
   if (amount === 0) {
     liqS = 100; liqLabel = "—";
     liqMsg = "Ingresa un monto para ver el análisis de liquidez.";
-  } else if (balEfectivo < amount) {
-    // No alcanza ni con el cobro proyectado
-    if (cobrarPronto && bal < amount) {
-      liqS = 20; liqLabel = "Muy baja";
-      liqMsg = `Hoy tienes ${money(bal)} en cuenta, pero cobras en ${nextPay.dias} día${nextPay.dias > 1 ? "s" : ""} (${money(nextPay.monto)}). Aún así, después del cobro no alcanzaría para ${money(amount)}.`;
-    } else if (cobrarPronto) {
-      liqS = 65; liqLabel = "Buena";
-      liqMsg = `Hoy tienes ${money(bal)}, pero cobras en ${nextPay.dias} día${nextPay.dias > 1 ? "s" : ""} (${money(nextPay.monto)}). Con ese cobro tendrías ${money(balProyectado)} — suficiente.`;
-    } else {
-      liqS = 5; liqLabel = "Muy baja";
-      if (nextPay && nextPay.dias > 0) {
-        liqMsg = `Hoy no tienes ${money(amount)} en cuenta (tienes ${money(bal)}). Tu próximo cobro es en ${nextPay.dias} día${nextPay.dias > 1 ? "s" : ""} por ${money(nextPay.monto)}.`;
-      } else if (bigGap) {
-        liqMsg = `Hoy no tienes ${money(amount)} en cuenta (tienes ${money(bal)}). Parece que tu ingreso de este período aún no ha entrado.`;
-      } else {
-        liqMsg = `Hoy no tienes ${money(amount)} en cuenta (tienes ${money(bal)}).`;
-      }
-    }
-  } else {
-    // Sí alcanza con el saldo efectivo
-    const pct = balAfterEfectivo / balEfectivo;
+  } else if (canBuyToday) {
+    const pct = balAfter / Math.max(1, bal);
     liqS = pct >= 0.6 ? 90 : pct >= 0.4 ? 75 : pct >= 0.2 ? 55 : pct >= 0.05 ? 35 : 15;
     liqLabel = scoreLabel(liqS);
-    if (cobrarPronto && bal < amount) {
-      liqMsg = `Hoy tienes ${money(bal)}, pero cobras en ${nextPay.dias} día${nextPay.dias > 1 ? "s" : ""} (${money(nextPay.monto)}). Con ese cobro tendrías ${money(balProyectado)} y te quedarían ${money(balAfterEfectivo)}.`;
+    const daily = balAfter / daysLeft;
+    liqMsg = `Puedes pagarla hoy. Te quedarían ${money(Math.round(balAfter))} en cuenta, aproximadamente ${money(Math.round(daily))}/día durante los ${daysLeft} días restantes del mes.`;
+  } else if (canBuyAfterNextPay) {
+    liqS = cobrarPronto ? 55 : nextPay.dias <= 15 ? 40 : 30;
+    liqLabel = scoreLabel(liqS);
+    liqMsg = `Hoy no tienes ${money(amount)} en cuenta (saldo: ${money(bal)}). Cuando recibas tu próximo cobro de ${money(nextPay.monto)} en ${nextPay.dias} día${nextPay.dias !== 1 ? "s" : ""}, tendrías ${money(balProyectado)} y, después de la compra, te quedarían ${money(balAfterProyectado)}. La compra sería posible entonces, no hoy.`;
+  } else {
+    liqS = 5; liqLabel = "Muy baja";
+    if (hasNextPay) {
+      const faltante = Math.max(0, amount - balProyectado);
+      liqMsg = `Hoy no tienes ${money(amount)} en cuenta (saldo: ${money(bal)}). Después de tu próximo cobro de ${money(nextPay.monto)} tendrías ${money(balProyectado)}, por lo que todavía faltarían ${money(faltante)}.`;
+    } else if (bigGap) {
+      liqMsg = `Hoy no tienes ${money(amount)} en cuenta (saldo: ${money(bal)}). Parece que tu ingreso de este período aún no ha entrado.`;
     } else {
-      const daily = balAfterEfectivo / daysLeft;
-      liqMsg = `Te quedarían ${money(Math.round(balAfterEfectivo))} en cuenta. Eso equivale a ~${money(Math.round(daily))}/día por los ${daysLeft} días restantes del mes.`;
+      liqMsg = `Hoy no tienes ${money(amount)} en cuenta (saldo: ${money(bal)}).`;
     }
   }
 
@@ -1644,23 +1640,25 @@ function buildPurchaseAnalysis(amount, itemName) {
   const habitsS = 70; const habitsLabel = "Sin datos";
   const habitsMsg = "Todavía no hay suficiente historial para detectar patrones de comportamiento.";
 
-  // 5. BIENESTAR (peso 10% — P8: lenguaje orientado a decisiones)
+  // 5. BIENESTAR (peso 10% — lenguaje orientado a decisiones)
   let wellS, wellLabel, wellMsg;
   const saludable = computeBaselineScore() >= 60;
   if (amount === 0) {
     wellS = 80; wellLabel = "—";
     wellMsg = "Ingresa un monto para evaluar el impacto en tu bienestar financiero.";
-  } else if (balEfectivo >= amount && afterPurch >= 0 && saludable) {
+  } else if (canBuyToday && afterPurch >= 0 && saludable) {
     wellS = 90; wellLabel = "Excelente";
-    wellMsg = cobrarPronto && bal < amount
-      ? `Aunque hoy el saldo está ajustado, cobras pronto y tus finanzas se mantienen saludables con esta compra.`
-      : "Tus finanzas siguen saludables incluso realizando esta compra. Tienes margen para este gasto.";
-  } else if (balEfectivo >= amount && afterPurch >= 0) {
+    wellMsg = "Tus finanzas siguen saludables incluso realizando esta compra. Tienes margen para este gasto.";
+  } else if (canBuyToday && afterPurch >= 0) {
     wellS = 60; wellLabel = "Buena";
-    wellMsg = "La compra es posible. Ajusta tus gastos variables el resto del mes para mantener el equilibrio.";
+    wellMsg = "La compra es posible hoy. Ajusta tus gastos variables el resto del mes para mantener el equilibrio.";
+  } else if (canBuyAfterNextPay && afterPurch >= 0) {
+    wellS = saludable ? 65 : 50;
+    wellLabel = saludable ? "Buena" : "Moderada";
+    wellMsg = `La compra no es posible hoy, pero sería viable después de tu próximo cobro. Espera hasta recibirlo antes de decidir.`;
   } else {
     wellS = 25; wellLabel = "Baja";
-    wellMsg = "Esta compra reduciría tu margen financiero para el resto del mes. No significa que sea imposible, pero aumenta el riesgo de quedarte sin efectivo antes del próximo ingreso.";
+    wellMsg = "Esta compra reduciría demasiado tu margen financiero. No es recomendable realizarla con tu situación actual.";
   }
 
   // P1+P2: SCORE COMPUESTO (escala 0-100 corregida, dividiendo por el máximo posible)
@@ -1670,26 +1668,20 @@ function buildPurchaseAnalysis(amount, itemName) {
   const score = Math.round(rawScore);
 
   // VEREDICTO FINAL
-  // REGLA ABSOLUTA: verde SOLO cuando el dinero está HOY en la cuenta.
-  // Si el saldo actual no cubre la compra, el máximo posible es amarillo.
-  // El Coach nunca contradice este veredicto — solo lo explica.
+  // Verde: el dinero está disponible hoy y las demás dimensiones son sanas.
+  // Amarillo: no está disponible hoy, pero el próximo cobro lo cubriría,
+  // o existe una condición financiera relevante.
+  // Rojo: ni hoy ni con el próximo cobro conocido alcanza.
   let verdict;
   if (amount === 0) {
     verdict = "neutral";
-  } else if (balEfectivo < amount) {
-    // Ni con el cobro proyectado alcanza → rojo siempre
-    verdict = "red";
-  } else if (bal < amount && cobrarPronto) {
-    // No alcanza HOY pero sí con el cobro inminente → MÁXIMO amarillo
-    // Verde es imposible: el dinero no está en tu mano ahora mismo.
+  } else if (!canBuyToday && canBuyAfterNextPay) {
     verdict = "yellow";
-  } else if (bal < amount) {
-    // No alcanza hoy y no hay cobro próximo → rojo
+  } else if (!canBuyToday) {
     verdict = "red";
   } else if (liqS <= 10) {
     verdict = "red";
   } else if (debtS < 50) {
-    // Tiene deuda de alto interés → máximo amarillo (principio financiero)
     verdict = score >= 45 ? "yellow" : "red";
   } else if (score >= 70) {
     verdict = "green";
@@ -1708,23 +1700,22 @@ function buildPurchaseAnalysis(amount, itemName) {
   } else if (verdict === "green") {
     verdictLabel = "🟢 Compra recomendable";
     reason = `Tienes ${money(bal)} en cuenta — cubre la compra y tus metas no se ven afectadas.`;
-  } else if (verdict === "yellow" && bal < amount && cobrarPronto) {
+  } else if (verdict === "yellow" && !canBuyToday && canBuyAfterNextPay) {
     verdictLabel = "🟡 Viable cuando cobres";
-    reason = `Hoy no tienes los ${money(amount)} (saldo: ${money(bal)}), pero cobras ${money(nextPay.monto)} en ${nextPay.dias} día${nextPay.dias !== 1 ? "s" : ""}. Con ese cobro puedes hacerla sin afectar tus metas.`;
+    reason = `Hoy no tienes los ${money(amount)} (saldo: ${money(bal)}). Después de tu próximo cobro de ${money(nextPay.monto)} en ${nextPay.dias} día${nextPay.dias !== 1 ? "s" : ""}, tendrías ${money(balProyectado)} y podrías realizarla. Espera a recibir ese dinero.`;
   } else if (verdict === "yellow" && debtS < 50) {
     verdictLabel = "🟡 Viable, pero tienes una deuda prioritaria";
     reason = `Puedes pagar la compra, pero tienes una deuda con "${topDebt?.name}" al ${topDebt?.interest_rate}% anual. Financieramente conviene reducir esa deuda primero.`;
   } else if (verdict === "yellow") {
     verdictLabel = "🟡 Viable, pero ajusta tus gastos";
     reason = `Puedes hacer la compra, pero te quedaría menos margen para el resto del mes. Revisa si puedes recortar algún gasto variable.`;
-  } else if (verdict === "red" && balEfectivo < amount) {
+  } else if (verdict === "red" && !canBuyToday) {
     verdictLabel = "🔴 No alcanza";
-    if (bal < amount && nextPay && nextPay.dias > 0 && !cobrarPronto) {
-      reason = `Hoy tienes ${money(bal)} en cuenta. Tu próximo cobro es en ${nextPay.dias} días por ${money(nextPay.monto)}, pero incluso con ese cobro no alcanzaría para ${money(amount)}.`;
-    } else if (bal < amount && nextPay && cobrarPronto) {
-      reason = `Incluso con tu próximo cobro (${money(nextPay.monto)} en ${nextPay.dias} días), el saldo proyectado de ${money(balProyectado)} no alcanza para ${money(amount)}.`;
+    if (hasNextPay) {
+      const faltante = Math.max(0, amount - balProyectado);
+      reason = `Hoy tienes ${money(bal)} en cuenta. Después de tu próximo cobro de ${money(nextPay.monto)} en ${nextPay.dias} día${nextPay.dias !== 1 ? "s" : ""}, tendrías ${money(balProyectado)}; todavía faltarían ${money(faltante)} para completar ${money(amount)}.`;
     } else {
-      reason = `Hoy tienes ${money(bal)} en cuenta.${nextPay ? ` Tu próximo cobro es en ${nextPay.dias} días.` : ""}`;
+      reason = `Hoy tienes ${money(bal)} en cuenta y no hay un próximo cobro configurado que permita proyectar esta compra.`;
     }
   } else {
     verdictLabel = "🔴 No recomendable ahora";
