@@ -1576,6 +1576,87 @@ let coachError = "";
 let coachSending = false;
 let lastPurchaseAnalysis = null;
 
+// Contexto conversacional de compra dentro del chat del Coach.
+// Permite que "quiero comprar tenis" + "1000 pesos" + "¿puedo ahora?"
+// invoquen el MISMO buildPurchaseAnalysis que usa la pantalla ¿Lo compro?
+// El chat nunca decide por su cuenta — solo extrae item+monto y delega al motor.
+let coachPurchaseContext = {
+  itemName: null,
+  amount: null,
+  awaitingAmount: false,
+  updatedAtTurn: null,
+};
+
+function containsPurchaseIntent(message) {
+  return /\b(comprar|comprarlo|comprarla|comprarme|comprármelo|comprármela|adquirir|pagar por)\b/i.test(message);
+}
+
+function isPurchaseFollowUpMsg(message) {
+  return [
+    /\bpuedo comprarlo ahora\b/i, /\bpuedo comprarla ahora\b/i, /\bpuedo compr[aá]rmelo ahora\b/i,
+    /\bcuando cobre\b/i, /\bpr[oó]ximo cobro\b/i, /\by despu[eé]s\b/i,
+    /\bentonces s[ií]\b/i, /\bme conviene\b/i, /\bpuedo hacerlo\b/i,
+  ].some(p => p.test(message));
+}
+
+// Extrae un monto SOLO cuando el mensaje tiene forma de precio — no cualquier número.
+function extractMoneyAmount(message) {
+  const normalized = String(message).toLowerCase().replace(/\s+/g, " ");
+  const match = normalized.match(/(?:rd\$?\s*)?(\d{1,3}(?:[.,]\d{3})+|\d+)(?:\s*(?:pesos?|dop))?\b/i);
+  if (!match) return null;
+  const amount = Number(match[1].replace(/[.,](?=\d{3}\b)/g, ""));
+  return Number.isFinite(amount) && amount > 0 ? amount : null;
+}
+
+// True solo si el mensaje ES un monto y nada más (ej. "1000 pesos") —
+// evita capturar "gano 30000 al mes" como si fuera el precio de una compra.
+function isAmountOnlyReply(message) {
+  const amount = extractMoneyAmount(message);
+  if (!amount) return false;
+  const cleaned = message.toLowerCase().replace(/rd\$?/g, "").replace(/pesos?|dop/g, "").replace(/[.,\s\d]/g, "");
+  return cleaned.length === 0;
+}
+
+function extractPurchaseItem(message) {
+  const match = message.match(/(?:comprar|comprarme|comprármelo|comprármela|adquirir)\s+(?:unos?|unas?|un|una|el|la)?\s*(.+?)(?:\s+(?:de|por)\s+rd?\$?\s*\d|[?.!,]|$)/i);
+  return match?.[1]?.trim() || null;
+}
+
+// Actualiza el contexto de compra del chat con lo que dice el mensaje actual.
+// Invalida el contexto si pasaron ~6 turnos sin referencias a la compra.
+function updateCoachPurchaseContext(message) {
+  const currentTurn = coachHistory.length;
+  if (coachPurchaseContext.updatedAtTurn !== null && currentTurn - coachPurchaseContext.updatedAtTurn > 12) {
+    coachPurchaseContext = { itemName: null, amount: null, awaitingAmount: false, updatedAtTurn: null };
+  }
+
+  const amount = extractMoneyAmount(message);
+
+  if (containsPurchaseIntent(message)) {
+    const itemName = extractPurchaseItem(message);
+    // Nuevo artículo explícito → empieza una compra nueva, no mezcla con la anterior.
+    if (itemName && coachPurchaseContext.itemName && itemName.toLowerCase() !== coachPurchaseContext.itemName.toLowerCase()) {
+      coachPurchaseContext = { itemName, amount: null, awaitingAmount: true, updatedAtTurn: currentTurn };
+    }
+    if (itemName) coachPurchaseContext.itemName = itemName;
+    if (amount) {
+      coachPurchaseContext.amount = amount;
+      coachPurchaseContext.awaitingAmount = false;
+    } else if (!coachPurchaseContext.amount) {
+      coachPurchaseContext.awaitingAmount = true;
+    }
+    coachPurchaseContext.updatedAtTurn = currentTurn;
+    return;
+  }
+
+  // El usuario respondió solo con el precio que se le pidió.
+  if (coachPurchaseContext.awaitingAmount && isAmountOnlyReply(message) && amount) {
+    coachPurchaseContext.amount = amount;
+    coachPurchaseContext.awaitingAmount = false;
+    coachPurchaseContext.updatedAtTurn = currentTurn;
+  }
+}
+
 async function sendCoachMessage() {
   if (coachSending) return; // evita envíos duplicados por doble Enter/clic
   const input = document.getElementById("coachInput");
@@ -1586,9 +1667,24 @@ async function sendCoachMessage() {
   coachSending = true;
   coachHistory.push({ role: "user", content: msg });
   // P4: limitar el historial en memoria a 20 mensajes (10 turnos).
-  // El slice al mandar ya limita a 10, pero sin esto el array crece indefinidamente.
   if (coachHistory.length > 20) coachHistory = coachHistory.slice(-20);
   input.value = "";
+
+  // Contexto conversacional de compra: si el chat resolvió item+monto
+  // (por ejemplo "quiero comprar tenis" → "1000 pesos"), invoca el MISMO
+  // motor que usa ¿Lo compro? — el chat nunca calcula por su cuenta.
+  updateCoachPurchaseContext(msg);
+  const purchaseRelated = containsPurchaseIntent(msg) || isPurchaseFollowUpMsg(msg) ||
+    (coachPurchaseContext.awaitingAmount && isAmountOnlyReply(msg));
+  const hasResolvedChatPurchase = Number(coachPurchaseContext.amount) > 0;
+  if (purchaseRelated && hasResolvedChatPurchase && state.analysis) {
+    lastPurchaseAnalysis = buildPurchaseAnalysis(
+      state.analysis,
+      coachPurchaseContext.amount,
+      coachPurchaseContext.itemName || "Compra consultada"
+    );
+  }
+
   renderApp();
   const typingEl = document.getElementById("coachTyping");
   if (typingEl) typingEl.style.display = "block";
@@ -1606,7 +1702,7 @@ async function sendCoachMessage() {
     if (error || data?.error) throw new Error(data?.error || error.message);
     coachHistory.push({ role: "assistant", content: data.reply });
   } catch (e) {
-    coachError = "No se pudo conectar con el coach. Revisá tu conexión e intentá de nuevo.";
+    coachError = "No se pudo conectar con el coach. Revisa tu conexión e intenta de nuevo.";
   } finally {
     coachSending = false;
   }
@@ -2112,6 +2208,9 @@ function wireDecisionActions(analysis) {
   // "Lo compré" → registra como gasto real reutilizando el flujo existente
   const buyBtn = document.getElementById("simBuyBtn");
   if (buyBtn) buyBtn.addEventListener("click", () => {
+    // Ya se decidió y se está registrando — invalidar el contexto de compra
+    // del chat para que el coach no siga hablando de algo ya resuelto.
+    coachPurchaseContext = { itemName: null, amount: null, awaitingAmount: false, updatedAtTurn: null };
     openLogModal(analysis.meta.amount, analysis.meta.itemName);
   });
 
