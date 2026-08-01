@@ -1553,13 +1553,10 @@ function buildPurchaseAnalysis(amount, itemName) {
     liqS * 0.35 + debtS * 0.20 + goalsS * 0.25 + habitsS * 0.10 + wellS * 0.10;
   const score = Math.round(rawScore);
 
-  // VEREDICTO FINAL — jerarquía de liquidez con cobro proyectado
-  // Reglas en orden de prioridad:
-  // 1. Si ni con el cobro proyectado alcanza → siempre rojo
-  // 2. Si cobra en ≤5 días y con ese cobro sobra holgadamente → puede ser verde
-  // 3. Si cobra en ≤5 días pero el margen es justo → amarillo
-  // 4. Si no hay cobro próximo y el saldo no alcanza hoy → rojo
-  // 5. Si el saldo alcanza pero hay deudas de alto interés → amarillo como máximo
+  // VEREDICTO FINAL
+  // REGLA ABSOLUTA: verde SOLO cuando el dinero está HOY en la cuenta.
+  // Si el saldo actual no cubre la compra, el máximo posible es amarillo.
+  // El Coach nunca contradice este veredicto — solo lo explica.
   let verdict;
   if (amount === 0) {
     verdict = "neutral";
@@ -1567,16 +1564,18 @@ function buildPurchaseAnalysis(amount, itemName) {
     // Ni con el cobro proyectado alcanza → rojo siempre
     verdict = "red";
   } else if (bal < amount && cobrarPronto) {
-    // No alcanza hoy pero sí con el cobro inminente (≤5 días)
-    // Si el saldo post-cobro-post-compra es holgado → verde
-    // Si es justo → amarillo
-    const pctRestante = balAfterProyectado / balProyectado;
-    verdict = (score >= 65 && debtS >= 50 && pctRestante >= 0.1)
-      ? "green"
-      : "yellow";
+    // No alcanza HOY pero sí con el cobro inminente → MÁXIMO amarillo
+    // Verde es imposible: el dinero no está en tu mano ahora mismo.
+    verdict = "yellow";
+  } else if (bal < amount) {
+    // No alcanza hoy y no hay cobro próximo → rojo
+    verdict = "red";
   } else if (liqS <= 10) {
     verdict = "red";
-  } else if (score >= 70 && debtS >= 50) {
+  } else if (debtS < 50) {
+    // Tiene deuda de alto interés → máximo amarillo (principio financiero)
+    verdict = score >= 45 ? "yellow" : "red";
+  } else if (score >= 70) {
     verdict = "green";
   } else if (score >= 45) {
     verdict = "yellow";
@@ -1585,23 +1584,36 @@ function buildPurchaseAnalysis(amount, itemName) {
   }
 
   const stars = verdict === "neutral" ? 0 : score >= 85 ? 5 : score >= 70 ? 4 : score >= 55 ? 3 : score >= 40 ? 2 : 1;
-  const verdictLabel = verdict === "green"
-    ? "🟢 Compra recomendable"
-    : verdict === "yellow"
-    ? "🟡 Viable, pero con precaución"
-    : verdict === "red"
-    ? "🔴 No recomendable en este momento"
-    : "";
+
+  // Labels contextuales — no genéricos
+  let verdictLabel, reason;
+  if (verdict === "neutral") {
+    verdictLabel = ""; reason = "";
+  } else if (verdict === "green") {
+    verdictLabel = "🟢 Compra recomendable";
+    reason = `Tienes ${money(bal)} en cuenta — cubre la compra y tus metas no se ven afectadas.`;
+  } else if (verdict === "yellow" && bal < amount && cobrarPronto) {
+    verdictLabel = "🟡 Viable cuando cobres";
+    reason = `Hoy no tienes los ${money(amount)} (saldo: ${money(bal)}), pero cobras ${money(nextPay.monto)} en ${nextPay.dias} día${nextPay.dias !== 1 ? "s" : ""}. Con ese cobro puedes hacerla sin afectar tus metas.`;
+  } else if (verdict === "yellow" && debtS < 50) {
+    verdictLabel = "🟡 Viable, pero tienes una deuda prioritaria";
+    reason = `Puedes pagar la compra, pero tienes una deuda con "${topDebt?.name}" al ${topDebt?.interest_rate}% anual. Financieramente conviene reducir esa deuda primero.`;
+  } else if (verdict === "yellow") {
+    verdictLabel = "🟡 Viable, pero ajusta tus gastos";
+    reason = `Puedes hacer la compra, pero te quedaría menos margen para el resto del mes. Revisa si puedes recortar algún gasto variable.`;
+  } else if (verdict === "red" && balEfectivo < amount) {
+    verdictLabel = "🔴 No alcanza";
+    reason = bal < amount && !cobrarPronto
+      ? `Hoy tienes ${money(bal)} en cuenta y no hay un cobro próximo que lo cubra.`
+      : `Incluso con tu próximo cobro, el saldo proyectado (${money(balProyectado)}) no alcanza para ${money(amount)}.`;
+  } else {
+    verdictLabel = "🔴 No recomendable ahora";
+    reason = `Esta compra compromete tu liquidez o tus compromisos financieros actuales.`;
+  }
 
   const summary = amount === 0
     ? "Ingresa el monto para analizar la compra."
-    : verdict === "green"
-    ? `Tienes liquidez suficiente y tus metas no se ven afectadas. Es buen momento para esta compra.`
-    : verdict === "yellow"
-    ? `La compra es posible, pero reducirá tu margen financiero. Considera si puede esperar.`
-    : bal < amount
-    ? `Hoy no tienes fondos suficientes para esta compra (saldo: ${money(bal)}).`
-    : `Esta compra compromete tu liquidez o tus compromisos financieros actuales.`;
+    : reason;
 
   // P6: OPORTUNIDADES ordenadas por impacto financiero
   let opportunityItems = [];
@@ -1619,24 +1631,35 @@ function buildPurchaseAnalysis(amount, itemName) {
     if (bal < fondoNecesario) opportunityItems.push({ stars: 3, text: `Fortalecer tu fondo de emergencia`, reason: `Te faltan ~${money(Math.round(fondoNecesario - bal))} para 3 meses de gastos fijos.` });
   }
 
-  // P9+P15: Mensaje rico para el coach (incluye el análisis completo)
+  // Coach recibe el análisis completo como DATO FIJO — no puede contradecirlo.
+  // Su rol es explicar, ampliar y responder preguntas sobre el veredicto.
   const itemText = itemName ? `"${itemName}"` : "un artículo";
+  const purchaseAnalysisForCoach = amount > 0 ? {
+    item: itemText,
+    amount,
+    verdict,
+    verdictLabel,
+    reason,
+    score,
+    dimensions: {
+      liquidez: { score: liqS, msg: liqMsg },
+      deudas:   { score: debtS, msg: debtMsg },
+      metas:    { score: goalsS, msg: goalsMsg },
+      bienestar:{ score: wellS, msg: wellMsg },
+    },
+  } : null;
+
   const coachPrompt = amount > 0
-    ? `Analicé comprar ${itemText} por ${money(amount)}.
+    ? `Resultado del motor de decisión (VEREDICTO OFICIAL — no recalcules ni contradigas):
 
-Resultado del motor de decisión:
-- Veredicto: ${verdictLabel}
-- Score: ${score}/100
-- Liquidez: ${liqS}/100 — ${liqMsg}
-- Deudas: ${debtS}/100 — ${debtMsg}
-- Metas: ${goalsS}/100 — ${goalsMsg}
-- Bienestar: ${wellS}/100 — ${wellMsg}
+${JSON.stringify(purchaseAnalysisForCoach, null, 0)}
 
-¿Puedes explicarme por qué llegaste a ese veredicto y qué alternativas tengo?`
+Explícame por qué el motor llegó a este veredicto y qué alternativas tengo.`
     : "";
 
   return {
-    verdict, score, stars, verdictLabel, summary, coachPrompt,
+    verdict, score, stars, verdictLabel, reason, summary, coachPrompt,
+    purchaseAnalysis: purchaseAnalysisForCoach,
     dimensions: {
       liquidez:    { score: liqS,   label: liqLabel,   msg: liqMsg   },
       deudas:      { score: debtS,  label: debtLabel,  msg: debtMsg  },
@@ -1677,7 +1700,7 @@ function tplSimular() {
 }
 
 function renderDecisionCard(analysis) {
-  const { verdict, score, stars, verdictLabel, summary, dimensions, actions, meta } = analysis;
+  const { verdict, score, stars, verdictLabel, reason, summary, dimensions, actions, meta } = analysis;
 
   const verdictColor = verdict === "green"
     ? "var(--success-text)" : verdict === "yellow"
@@ -1733,8 +1756,8 @@ function renderDecisionCard(analysis) {
   return `
     <div class="card" style="background:${verdictBg}; margin-bottom:10px; text-align:center;">
       ${starsHtml ? `<div style="margin-bottom:6px;">${starsHtml}</div>` : ""}
-      <p style="font-size:16px; font-weight:500; color:${verdictColor}; margin:0 0 6px;">${verdictLabel}</p>
-      <p style="font-size:12px; color:${verdictColor}; margin:0 0 10px; opacity:0.9; line-height:1.5;">${summary}</p>
+      <p style="font-size:16px; font-weight:600; color:${verdictColor}; margin:0 0 10px;">${verdictLabel}</p>
+      <p style="font-size:13px; color:${verdictColor}; margin:0 0 12px; opacity:0.9; line-height:1.6;">${reason}</p>
       <div style="display:inline-flex; align-items:center; gap:6px; background:rgba(255,255,255,0.4); border-radius:20px; padding:4px 12px;">
         <span style="font-size:13px; font-weight:600; color:${verdictColor};">Score ${score}/100</span>
         <span style="font-size:11px; color:${verdictColor}; opacity:0.8;">· Confianza ${score >= 70 ? "Alta" : score >= 45 ? "Media" : "Baja"}</span>
