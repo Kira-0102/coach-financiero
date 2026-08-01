@@ -159,7 +159,7 @@ async function loadState() {
     budgets: budgets || [],
   };
 
-  // FinancialEngine: recalcular state.analysis cada vez que cambia state.
+  // FinancialCore: recalcular state.analysis cada vez que cambia state.
   // Todas las pantallas leen FA() en vez de recalcular por su cuenta.
   computeAnalysis();
 }
@@ -356,7 +356,7 @@ function computeBaselineScore() {
 //
 // CAPAS:
 //   FinancialData      → normalización de datos crudos
-//   FinancialEngine    → describe la realidad financiera (puro)
+//   FinancialCore    → describe la realidad financiera (puro)
 //   RecommendationEngine → prioridades, estrategia, next best action
 //   PurchaseEngine     → análisis de compras (Fase 3)
 //   CoachContextBuilder → contexto para la IA (Fase 5)
@@ -366,7 +366,7 @@ function computeBaselineScore() {
 // Incrementar cuando cambie la estructura de FinancialAnalysis
 // para que módulos que consumen el análisis puedan verificar.
 // ================================================================
-const FA_SCHEMA_VERSION = 1;
+const FA_SCHEMA_VERSION = 2;
 
 // ---------------------------------------------------------------
 // @legacy — WRAPPERS DE COMPATIBILIDAD TEMPORAL
@@ -385,7 +385,7 @@ const FA_SCHEMA_VERSION = 1;
 // El engine NUNCA lee state directamente — solo FinancialData.
 // Resuelve frecuencias, calcula próximo cobro, normaliza montos.
 // ---------------------------------------------------------------
-function buildFinancialData() {
+function buildFinancialData(asOf = new Date()) {
   const raw = {
     account:      state.account      ?? null,
     profile:      state.profile      ?? null,
@@ -407,7 +407,7 @@ function buildFinancialData() {
   const annualInc    = monthlyInc * 12;
 
   // Próximo cobro — resuelto en la capa de normalización
-  const today   = new Date();
+  const today = new Date(asOf);
   const m = today.getMonth(), y = today.getFullYear();
   let nextPayDate = null, daysUntilPay = null, nextPayAmount = null;
   if (raw.profile.pay_day_1) {
@@ -435,6 +435,20 @@ function buildFinancialData() {
     return true;
   }).reduce((s, t) => s + Math.abs(Number(t.amount)), 0);
 
+  // Gastos del mes agrupados por categoría 
+  const spendingByCategory = {}; 
+  for (const category of raw.categories) { 
+    spendingByCategory[category.id] = 0; 
+  } 
+  for (const transaction of txMonth) { 
+    const amount = Number(transaction.amount); 
+    if (amount >= 0) continue; 
+    if (!transaction.category_id) continue; 
+    spendingByCategory[transaction.category_id] = 
+    (spendingByCategory[transaction.category_id] || 0) + 
+    Math.abs(amount); 
+  }
+
   const monthlyFixed = raw.fixed.reduce((s, f) => s + Number(f.estimated_amount), 0);
   const availToday   = Number(raw.account.computed_balance ?? raw.account.initial_balance ?? 0);
   const daysInMonth  = new Date(y, m + 1, 0).getDate();
@@ -460,7 +474,7 @@ function buildFinancialData() {
     nextPayDate, daysUntilPay, nextPayAmount,
 
     // Gastos
-    monthlyFixed, spentThisMonth: Math.round(spentVar),
+    monthlyFixed, spentThisMonth: Math.round(spentVar), spendingByCategory,
     availableToday: Math.round(availToday),
     daysLeft, dailyRate: availToday > 0 ? Math.round(availToday / daysLeft) : 0,
 
@@ -478,12 +492,13 @@ function buildFinancialData() {
 }
 
 // ---------------------------------------------------------------
-// CAPA 2 — FinancialEngine (PURO — nunca modifica state)
+// CAPA 2 — FinancialCore (PURO — nunca modifica state)
 // Única responsabilidad: describir la realidad financiera.
 // No toma decisiones, no prioriza, no recomienda.
 // Organizado por dominios para facilitar crecimiento futuro.
 // ---------------------------------------------------------------
-function FinancialEngine(fd) {
+function FinancialCore(fd, options = {}) {
+  const asOf = options.asOf ? new Date(options.asOf) : new Date();
   if (!fd.normalized) return FinancialAnalysis.empty(fd.raw);
 
   const n = fd.normalized, raw = fd.raw;
@@ -506,13 +521,11 @@ function FinancialEngine(fd) {
   // DOMINIO: spending
   const spending = {
     thisMonth: n.spentThisMonth, fixed: n.monthlyFixed, variable: n.spentThisMonth,
-    byCategory: Object.fromEntries(
-      (raw.categories || []).map(c => [c.id, spentThisMonthByCategory(c.id)])
-    ),
+    byCategory: n.spendingByCategory,
   };
 
   // DOMINIO: goals (describe el estado, no decide qué hacer)
-  const now = new Date();
+  const now = asOf;
   const activeGoals    = raw.goals.filter(g => g.status !== "completed");
   const completedGoals = raw.goals.filter(g => g.status === "completed");
   const totalPace = activeGoals.reduce((s, g) => {
@@ -717,11 +730,14 @@ const FinancialAnalysis = {
 // Se llama después de cada loadState(). Es puro en el sentido
 // de que no tiene efectos secundarios más allá de state.analysis.
 // ---------------------------------------------------------------
-function computeAnalysis() {
-  const fd         = buildFinancialData();          // Capa 1
-  const analysis   = FinancialEngine(fd);           // Capa 2
-  const recs       = RecommendationEngine(analysis); // Capa 3
-  state.analysis   = { ...analysis, recommendations: recs };
+function computeAnalysis(asOf = new Date()) {
+  const fd = buildFinancialData(asOf);                 // Capa 1
+  const analysis = FinancialCore(fd, { asOf });         // Capa 2
+  const recs = RecommendationEngine(analysis);          // Capa 3
+  state.analysis = {
+    ...analysis,
+    recommendations: recs,
+  };
   return state.analysis;
 }
 
@@ -787,7 +803,7 @@ function runEngineTests() {
     debts: [{ current_balance: 10000, interest_rate: 40, minimum_payment: 2000, debt_type: "lender" }],
     goals: [], fixed: [], transactions: [], budgets: [] };
   const fd6 = buildFinancialData();
-  const a6 = FinancialEngine(fd6);
+  const a6 = FinancialCore(fd6);
   assert("Caso 6: saldo negativo + deuda → stage survival", a6.stage === "survival");
 
   // Caso 7: saldo positivo sin deudas → stage stability o building
