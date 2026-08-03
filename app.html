@@ -17,7 +17,7 @@
 <script type="module">
 import { supabase } from "./js/supabaseClient.js";
 
-const APP_BUILD = "financial-core-v2-integrity-final-2026-08-03";
+const APP_BUILD = "financial-core-v3-debts-2026-08-03";
 window.__APP_BUILD__ = APP_BUILD;
 console.info(`[Coach Financiero] build ${APP_BUILD}`);
 
@@ -215,11 +215,10 @@ async function loadState() {
     supabase.from("budgets").select("*, categories(name)").is("effective_to", null),
     // Se cargan completos para proteger movimientos vinculados; los cálculos filtran el mes actual.
     supabase.from("goal_contributions").select("id, goal_id, transaction_id, amount, amount_after, created_at"),
-    supabase.from("debt_payments").select("id, debt_id, transaction_id, amount, balance_after, created_at"),
+    supabase.from("debt_payments").select("id, debt_id, transaction_id, amount, balance_before, balance_after, principal_component, interest_component, fee_component, payment_number, paid_at"),
   ]);
 
-  const requiredResults = results.slice(0, 8);
-  const firstError = requiredResults.find(result => result.error)?.error;
+  const firstError = results.find(result => result.error)?.error;
   if (firstError) throw firstError;
 
   const [accountsResult, profileResult, goalsResult, fixedResult, debtsResult, transactionsResult, monthTransactionsResult, budgetsResult, contributionsResult, paymentsResult] = results;
@@ -263,6 +262,249 @@ function calcPMT(principal, annualRatePct, periods) {
   if (!annualRatePct || annualRatePct <= 0 || !periods) return principal / periods;
   const i = annualRatePct / 100 / 12;
   return principal * i * Math.pow(1 + i, periods) / (Math.pow(1 + i, periods) - 1);
+}
+
+const DEBT_PLAN_TYPES = [
+  { value: "amortized", label: "Préstamo con cuotas sobre saldo" },
+  { value: "flat_total", label: "Interés total por todo el acuerdo" },
+  { value: "flat_periodic", label: "Interés fijo por cada período" },
+  { value: "credit_card", label: "Tarjeta o línea de crédito" },
+  { value: "no_interest", label: "Deuda sin intereses" },
+  { value: "legacy", label: "Registro básico anterior" },
+];
+
+const PAYMENT_FREQUENCIES = [
+  { value: "monthly", label: "Mensual" },
+  { value: "biweekly", label: "Quincenal" },
+  { value: "weekly", label: "Semanal" },
+];
+
+function paymentPeriodsPerYear(frequency) {
+  if (frequency === "weekly") return 52;
+  if (frequency === "biweekly") return 24;
+  return 12;
+}
+
+function paymentPeriodsPerMonth(frequency) {
+  if (frequency === "weekly") return 52 / 12;
+  if (frequency === "biweekly") return 2;
+  return 1;
+}
+
+function monthlyPaymentEquivalent(amount, frequency = "monthly") {
+  return Math.round((Number(amount) || 0) * paymentPeriodsPerMonth(frequency));
+}
+
+function periodicInterestRate(ratePct, rateType = "annual", paymentFrequency = "monthly") {
+  const rate = Math.max(0, Number(ratePct) || 0) / 100;
+  if (rateType === "per_period") return rate;
+  if (rateType === "monthly") return rate / paymentPeriodsPerMonth(paymentFrequency);
+  if (rateType === "annual") return rate / paymentPeriodsPerYear(paymentFrequency);
+  return 0;
+}
+
+function debtRateLabel(debt) {
+  const rate = Number(debt?.interest_rate) || 0;
+  if (!rate || debt?.plan_type === "no_interest") return "Sin intereses";
+  const type = debt?.interest_rate_type || "annual";
+  if (type === "total_term") return `${rate}% total del acuerdo`;
+  if (type === "monthly") return `${rate}% mensual`;
+  if (type === "per_period") {
+    const f = PAYMENT_FREQUENCIES.find(x => x.value === debt?.payment_frequency)?.label?.toLowerCase() || "por período";
+    return `${rate}% ${f}`;
+  }
+  return `${rate}% anual`;
+}
+
+function debtPlanLabel(planType) {
+  return DEBT_PLAN_TYPES.find(x => x.value === planType)?.label || "Registro básico";
+}
+
+function annualizedDebtRate(debt) {
+  const rate = Math.max(0, Number(debt?.interest_rate) || 0);
+  const type = debt?.interest_rate_type || "annual";
+  const frequency = debt?.payment_frequency || "monthly";
+  if (!rate || debt?.plan_type === "no_interest") return 0;
+  if (type === "monthly") return rate * 12;
+  if (type === "per_period") return rate * paymentPeriodsPerYear(frequency);
+  if (type === "total_term") {
+    const term = Math.max(1, Number(debt?.term_count || debt?.remaining_installments) || 1);
+    return rate * paymentPeriodsPerYear(frequency) / term;
+  }
+  return rate;
+}
+
+function simulateAmortizedPayoff(principal, periodicRate, payment, maxPeriods = 1200) {
+  let balance = Math.max(0, Number(principal) || 0);
+  const rate = Math.max(0, Number(periodicRate) || 0);
+  const installment = Math.max(0, Number(payment) || 0);
+  if (balance <= 0 || installment <= 0) return { paysOff: balance <= 0, periods: 0, totalPaid: 0, totalInterest: 0 };
+  if (rate > 0 && installment <= balance * rate) {
+    return { paysOff: false, periods: null, totalPaid: null, totalInterest: null };
+  }
+
+  let periods = 0;
+  let totalPaid = 0;
+  let totalInterest = 0;
+  while (balance > 0.005 && periods < maxPeriods) {
+    const interest = balance * rate;
+    const due = balance + interest;
+    const paid = Math.min(installment, due);
+    balance = Math.max(0, due - paid);
+    totalPaid += paid;
+    totalInterest += interest;
+    periods += 1;
+  }
+  return {
+    paysOff: balance <= 0.005,
+    periods: balance <= 0.005 ? periods : null,
+    totalPaid: balance <= 0.005 ? Math.round(totalPaid * 100) / 100 : null,
+    totalInterest: balance <= 0.005 ? Math.round(totalInterest * 100) / 100 : null,
+  };
+}
+
+function calculateDebtPlan({
+  planType = "amortized",
+  originalAmount = 0,
+  interestRate = 0,
+  interestRateType = "annual",
+  paymentFrequency = "monthly",
+  termCount = 0,
+  scheduledPayment = 0,
+} = {}) {
+  const principal = Math.max(0, Number(originalAmount) || 0);
+  const rate = Math.max(0, Number(interestRate) || 0);
+  const term = Math.max(0, Math.trunc(Number(termCount) || 0));
+  const manualPayment = Math.max(0, Number(scheduledPayment) || 0);
+
+  let periodicRate = 0;
+  let estimatedInterest = 0;
+  let totalPayable = principal;
+  let payment = manualPayment;
+  let variableTotal = false;
+  let payoffPeriods = term || null;
+
+  if (planType === "credit_card") {
+    periodicRate = periodicInterestRate(rate, interestRateType, "monthly");
+    estimatedInterest = principal * periodicRate;
+    totalPayable = null;
+    variableTotal = true;
+  } else if (planType === "flat_total") {
+    estimatedInterest = principal * (rate / 100);
+    totalPayable = principal + estimatedInterest;
+    if (!payment && term > 0) payment = totalPayable / term;
+  } else if (planType === "flat_periodic") {
+    periodicRate = rate / 100;
+    estimatedInterest = term > 0 ? principal * periodicRate * term : 0;
+    totalPayable = principal + estimatedInterest;
+    if (!payment && term > 0) payment = totalPayable / term;
+  } else if (planType === "amortized") {
+    periodicRate = periodicInterestRate(rate, interestRateType, paymentFrequency);
+    if (!payment && term > 0) {
+      payment = periodicRate > 0
+        ? principal * periodicRate * Math.pow(1 + periodicRate, term) / (Math.pow(1 + periodicRate, term) - 1)
+        : principal / term;
+    }
+    if (payment > 0) {
+      const payoff = simulateAmortizedPayoff(principal, periodicRate, payment);
+      if (payoff.paysOff) {
+        totalPayable = payoff.totalPaid;
+        estimatedInterest = payoff.totalInterest;
+        payoffPeriods = payoff.periods;
+      } else {
+        totalPayable = null;
+        estimatedInterest = principal * periodicRate;
+        payoffPeriods = null;
+        variableTotal = true;
+      }
+    }
+  } else if (planType === "no_interest") {
+    if (!payment && term > 0) payment = principal / term;
+    totalPayable = principal;
+    estimatedInterest = 0;
+  } else {
+    totalPayable = principal;
+    estimatedInterest = 0;
+  }
+
+  return {
+    principal: Math.round(principal * 100) / 100,
+    periodicRate,
+    scheduledPayment: Math.round(payment * 100) / 100,
+    monthlyEquivalent: monthlyPaymentEquivalent(payment, paymentFrequency),
+    totalPayable: totalPayable == null ? null : Math.round(totalPayable * 100) / 100,
+    estimatedInterest: Math.round(estimatedInterest * 100) / 100,
+    payoffPeriods,
+    variableTotal,
+  };
+}
+
+function estimateDebtPaymentBreakdown(debt, amount, manualInterest = null, feeAmount = 0) {
+  const payment = Math.max(0, Number(amount) || 0);
+  const fee = Math.max(0, Number(feeAmount) || 0);
+  const available = Math.max(0, payment - fee);
+  const planType = debt?.plan_type || "legacy";
+  const principal = Math.max(0, Number(debt?.principal_outstanding ?? debt?.current_balance) || 0);
+  const existingInterest = Math.max(0, Number(debt?.interest_outstanding) || 0);
+  const currentBalance = Math.max(0, Number(debt?.current_balance) || (principal + existingInterest));
+
+  let interestCharge = 0;
+  let interestComponent = 0;
+
+  if (manualInterest != null && Number.isFinite(Number(manualInterest))) {
+    const requestedInterest = Math.max(0, Number(manualInterest));
+    if (["flat_total", "flat_periodic"].includes(planType)) {
+      interestComponent = Math.min(available, requestedInterest, existingInterest);
+    } else if (planType === "no_interest") {
+      interestComponent = 0;
+    } else {
+      interestComponent = Math.min(available, requestedInterest);
+      if (planType === "amortized") {
+        interestCharge = Math.max(0, interestComponent - existingInterest);
+      }
+    }
+  } else if (planType === "amortized") {
+    interestCharge = principal * periodicInterestRate(
+      debt?.interest_rate,
+      debt?.interest_rate_type || "annual",
+      debt?.payment_frequency || "monthly"
+    );
+    interestComponent = Math.min(available, existingInterest + interestCharge);
+  } else if (["flat_total", "flat_periodic"].includes(planType) && currentBalance > 0) {
+    interestComponent = Math.min(existingInterest, available * (existingInterest / currentBalance));
+  } else if (existingInterest > 0) {
+    interestComponent = Math.min(existingInterest, available);
+  }
+
+  let principalComponent = Math.max(0, available - interestComponent);
+  if (!["credit_card", "legacy"].includes(planType)) {
+    principalComponent = Math.min(principal, principalComponent);
+  }
+
+  let newPrincipal;
+  let newInterest;
+  let newBalance;
+
+  if (["credit_card", "legacy"].includes(planType)) {
+    newBalance = Math.max(0, currentBalance - available);
+    newPrincipal = newBalance;
+    newInterest = 0;
+  } else {
+    newPrincipal = Math.max(0, principal - principalComponent);
+    newInterest = Math.max(0, existingInterest + interestCharge - interestComponent);
+    newBalance = newPrincipal + newInterest;
+  }
+
+  return {
+    payment,
+    fee: Math.round(fee * 100) / 100,
+    interestCharge: Math.round(interestCharge * 100) / 100,
+    interestComponent: Math.round(interestComponent * 100) / 100,
+    principalComponent: Math.round(principalComponent * 100) / 100,
+    newPrincipal: Math.round(newPrincipal * 100) / 100,
+    newInterest: Math.round(newInterest * 100) / 100,
+    newBalance: Math.round(newBalance * 100) / 100,
+  };
 }
 
 function goalPriorityLabel(priority) {
@@ -478,9 +720,10 @@ function buildFinancialData(asOf = new Date()) {
     return date.getFullYear() === y && date.getMonth() === m;
   };
   const debtPaidThisMonth = raw.debtPayments
-    .filter(p => isCurrentMonth(p.created_at))
+    .filter(p => isCurrentMonth(p.paid_at || p.created_at))
     .reduce((map, p) => {
-      map[p.debt_id] = (map[p.debt_id] || 0) + Number(p.amount || 0);
+      const appliedToDebt = Math.max(0, Number(p.amount || 0) - Number(p.fee_component || 0));
+      map[p.debt_id] = (map[p.debt_id] || 0) + appliedToDebt;
       return map;
     }, {});
   const goalPaidThisMonth = raw.goalContributions
@@ -491,7 +734,10 @@ function buildFinancialData(asOf = new Date()) {
     }, {});
 
   const debtCommitment = activeDebts.reduce((s, d) => {
-    const planned = Number(d.minimum_payment) || 0;
+    const planned = monthlyPaymentEquivalent(
+      Number(d.scheduled_payment ?? d.minimum_payment) || 0,
+      d.payment_frequency || "monthly"
+    );
     const paid = debtPaidThisMonth[d.id] || 0;
     return s + Math.max(0, planned - paid);
   }, 0);
@@ -636,11 +882,14 @@ function FinancialCore(fd, options = {}) {
 
   // DOMINIO: debts (describe el estado, no recomienda estrategia)
   const activeDebts       = raw.debts.filter(isDebtActive);
-  const sortedDebts       = [...activeDebts].sort((a, b) => (Number(b.interest_rate)||0) - (Number(a.interest_rate)||0));
+  const sortedDebts       = [...activeDebts].sort((a, b) => annualizedDebtRate(b) - annualizedDebtRate(a));
   const topDebt           = sortedDebts[0] ?? null;
   const totalDebtAmt      = activeDebts.reduce((s, d) => s + Number(d.current_balance), 0);
-  const monthlyDebtCommit = activeDebts.reduce((s, d) => s + (Number(d.minimum_payment)||0), 0);
-  const topRate           = Number(topDebt?.interest_rate) || 0;
+  const monthlyDebtCommit = activeDebts.reduce((s, d) => s + monthlyPaymentEquivalent(
+    Number(d.scheduled_payment ?? d.minimum_payment) || 0,
+    d.payment_frequency || "monthly"
+  ), 0);
+  const topRate           = annualizedDebtRate(topDebt);
   const debtRisk = topDebt
     ? (topRate >= 30 ? "critical" : topRate >= 15 ? "high" : "moderate")
     : "none";
@@ -730,8 +979,8 @@ function RecommendationEngine(analysis) {
       id: "pay_debt_critical", category: "debt",
       label: `Liquidar deuda "${debts.topDebt.name}"`,
       impact: 98,
-      why: `Tasa ${debts.topDebt.interest_rate}% anual — cada mes que pasa pierdes dinero`,
-      amount: Number(debts.topDebt.minimum_payment) || null,
+      why: `${debtRateLabel(debts.topDebt)} — cada período que pasa aumenta el costo`,
+      amount: Number(debts.topDebt.scheduled_payment ?? debts.topDebt.minimum_payment) || null,
     });
   }
 
@@ -758,8 +1007,8 @@ function RecommendationEngine(analysis) {
       id: "pay_debt_high", category: "debt",
       label: `Reducir "${debts.topDebt.name}"`,
       impact: 78,
-      why: `${debts.topDebt.interest_rate}% anual es una tasa alta`,
-      amount: Number(debts.topDebt.minimum_payment) || null,
+      why: `${debtRateLabel(debts.topDebt)} representa un costo alto`,
+      amount: Number(debts.topDebt.scheduled_payment ?? debts.topDebt.minimum_payment) || null,
     });
   }
 
@@ -916,6 +1165,49 @@ function runEngineTests() {
     assert("Precio explícito sí se extrae", extractMoneyAmount("Cuesta RD$2,500") === 2500);
     assert("Plural comprarlos es seguimiento", containsPurchaseIntent("¿Puedo comprarlos ahora?") && isPurchaseFollowUpMsg("¿Puedo comprarlos ahora?"));
     assert("Pronombre no se convierte en artículo ahora", extractPurchaseItem("¿Puedo comprármelo ahora?") === null);
+
+    const amortizedPlan = calculateDebtPlan({
+      planType: "amortized", originalAmount: 20000, interestRate: 45,
+      interestRateType: "annual", paymentFrequency: "monthly", termCount: 10,
+    });
+    assert("Préstamo 20k al 45% anual en 10 meses calcula cuota ~RD$2,435", Math.abs(amortizedPlan.scheduledPayment - 2435.23) < 1);
+    assert("Préstamo amortizado muestra intereses totales ~RD$4,352", Math.abs(amortizedPlan.estimatedInterest - 4352.27) < 2);
+
+    const flatTotalPlan = calculateDebtPlan({
+      planType: "flat_total", originalAmount: 20000, interestRate: 45,
+      interestRateType: "total_term", paymentFrequency: "monthly", termCount: 5,
+    });
+    assert("45% total en 5 meses produce total RD$29,000", flatTotalPlan.totalPayable === 29000);
+    assert("45% total en 5 meses produce cuota RD$5,800", flatTotalPlan.scheduledPayment === 5800);
+
+    const flatPeriodicPlan = calculateDebtPlan({
+      planType: "flat_periodic", originalAmount: 20000, interestRate: 10,
+      interestRateType: "per_period", paymentFrequency: "monthly", termCount: 5,
+    });
+    assert("10% mensual plano por 5 meses produce RD$10,000 de interés", flatPeriodicPlan.estimatedInterest === 10000);
+    assert("45% total en 5 meses se anualiza como riesgo alto", annualizedDebtRate({
+      plan_type: "flat_total", interest_rate: 45, interest_rate_type: "total_term",
+      payment_frequency: "monthly", term_count: 5,
+    }) === 108);
+    assert("10% mensual equivale a 120% anual para evaluar riesgo", annualizedDebtRate({
+      plan_type: "amortized", interest_rate: 10, interest_rate_type: "monthly",
+      payment_frequency: "monthly", term_count: 5,
+    }) === 120);
+
+    const paymentBreakdown = estimateDebtPaymentBreakdown({
+      plan_type: "amortized", current_balance: 20000, principal_outstanding: 20000,
+      interest_outstanding: 0, interest_rate: 45, interest_rate_type: "annual",
+      payment_frequency: "monthly",
+    }, 2435.23, null, 0);
+    assert("Primer pago separa ~RD$750 de interés", Math.abs(paymentBreakdown.interestComponent - 750) < 0.02);
+    assert("Primer pago reduce capital ~RD$1,685", Math.abs(paymentBreakdown.principalComponent - 1685.23) < 0.02);
+
+    const insufficientInterestPayment = estimateDebtPaymentBreakdown({
+      plan_type: "amortized", current_balance: 20000, principal_outstanding: 20000,
+      interest_outstanding: 0, interest_rate: 45, interest_rate_type: "annual",
+      payment_frequency: "monthly",
+    }, 500, null, 0);
+    assert("Pago menor que el interés puede aumentar el saldo", insufficientInterestPayment.newBalance > 20000);
 
   } catch (error) {
     results.push({ desc: `La batería lanzó una excepción: ${error.message}`, ok: false });
@@ -1483,8 +1775,12 @@ function buildCoachContext({ purchaseMode = false, purchaseAnalysis = null } = {
     debts: (debtsAnalysis?.sorted || []).map(d => ({
       name: d.name,
       balance: Number(d.current_balance),
-      annualRate: d.interest_rate == null ? null : Number(d.interest_rate),
-      monthlyPayment: d.minimum_payment == null ? null : Math.round(Number(d.minimum_payment)),
+      annualRate: annualizedDebtRate(d),
+      rateLabel: debtRateLabel(d),
+      monthlyPayment: monthlyPaymentEquivalent(
+        Number(d.scheduled_payment ?? d.minimum_payment) || 0,
+        d.payment_frequency || "monthly"
+      ),
     })),
   };
 }
@@ -2566,65 +2862,205 @@ function fixedAddForm() {
   `;
 }
 
-function tplDeudas() {
-  if (state.debts.length === 0) {
-    return `<div class="empty-state"><div class="icon-circle">📄</div><p style="font-size:13px; color:var(--text-muted);">No tienes deudas registradas.</p></div>
-      ${debtAddForm()}`;
+function formatDateDO(value) {
+  if (!value) return null;
+  const date = new Date(`${String(value).slice(0, 10)}T12:00:00`);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleDateString("es-DO", { day: "numeric", month: "short", year: "numeric" });
+}
+
+function debtPaymentStats(debtId) {
+  const payments = (state.debtPayments || []).filter(p => p.debt_id === debtId);
+  return {
+    payments,
+    cashTotal: payments.reduce((s, p) => s + Number(p.amount || 0), 0),
+    total: payments.reduce((s, p) => s + Math.max(0, Number(p.amount || 0) - Number(p.fee_component || 0)), 0),
+    principal: payments.reduce((s, p) => s + Number(p.principal_component || 0), 0),
+    interest: payments.reduce((s, p) => s + Number(p.interest_component || 0), 0),
+    fees: payments.reduce((s, p) => s + Number(p.fee_component || 0), 0),
+  };
+}
+
+function debtPlanPreviewHTML(plan, { planType, paymentFrequency, termCount, currentBalance = null } = {}) {
+  if (!plan || plan.principal <= 0) {
+    return `<div class="card" style="text-align:center; padding:12px;"><p style="font-size:11px;color:var(--text-muted);margin:0;">Completa el capital y las condiciones para ver el resumen.</p></div>`;
   }
+
+  const frequencyLabel = PAYMENT_FREQUENCIES.find(x => x.value === paymentFrequency)?.label || "Mensual";
+  const totalText = plan.totalPayable == null ? "No se liquida con esa cuota" : money(plan.totalPayable);
+  const displayedTerm = plan.payoffPeriods || termCount;
+  const interestText = planType === "credit_card"
+    ? `${money(plan.estimatedInterest)} aprox. por mes sobre el saldo actual`
+    : money(plan.estimatedInterest);
+
   return `
-    <h1 style="text-align:left; margin-bottom:14px;">Tus deudas</h1>
-    ${state.debts.map(d => {
-      const paid = Number(d.original_amount) - Number(d.current_balance);
-      const pct = d.original_amount > 0 ? Math.round((paid / Number(d.original_amount)) * 100) : 0;
-      const isPaidOff = Number(d.current_balance) <= 0;
-      const typeInfo = DEBT_TYPES.find(t => t.value === d.debt_type);
-      return `
+    <div class="card accent" style="margin-top:10px;">
+      <p style="font-size:12px;font-weight:600;color:var(--teal);margin:0 0 8px;">Resumen estimado</p>
+      <div class="row-between" style="font-size:11px;margin-bottom:4px;"><span>Capital registrado</span><strong>${money(plan.principal)}</strong></div>
+      ${currentBalance != null ? `<div class="row-between" style="font-size:11px;margin-bottom:4px;"><span>Saldo pendiente hoy</span><strong>${money(currentBalance)}</strong></div>` : ""}
+      <div class="row-between" style="font-size:11px;margin-bottom:4px;"><span>Frecuencia</span><strong>${frequencyLabel}</strong></div>
+      ${displayedTerm > 0 ? `<div class="row-between" style="font-size:11px;margin-bottom:4px;"><span>${planType === "amortized" ? "Plazo estimado" : "Plazo"}</span><strong>${displayedTerm} cuota${displayedTerm === 1 ? "" : "s"}</strong></div>` : ""}
+      <div class="row-between" style="font-size:11px;margin-bottom:4px;"><span>Cuota estimada/acordada</span><strong>${plan.scheduledPayment > 0 ? money(plan.scheduledPayment) : "No definida"}</strong></div>
+      <div class="row-between" style="font-size:11px;margin-bottom:4px;"><span>Intereses estimados</span><strong>${interestText}</strong></div>
+      <div class="row-between" style="font-size:11px;padding-top:6px;border-top:1px solid #bfdad8;"><span>Total estimado a pagar</span><strong>${totalText}</strong></div>
+      <p style="font-size:10px;color:var(--text-muted);margin:8px 0 0;line-height:1.45;">Estimación informativa. El contrato real puede incluir seguros, mora, comisiones o métodos de cálculo distintos.</p>
+    </div>
+  `;
+}
+
+function tplDeudas() {
+  const debtCards = state.debts.map(d => {
+    const stats = debtPaymentStats(d.id);
+    const scheduled = Number(d.scheduled_payment ?? d.minimum_payment) || 0;
+    const isVariableDebt = (d.plan_type || "legacy") === "credit_card";
+    const totalPaid = Number(d.total_paid) || stats.total || Math.max(0, Number(d.original_amount) - Number(d.current_balance));
+    const totalPlan = isVariableDebt ? 0 : (Number(d.total_payable) || Number(d.original_amount) || 0);
+    const pct = totalPlan > 0 ? Math.max(0, Math.min(100, Math.round((totalPaid / totalPlan) * 100))) : 0;
+    const isPaidOff = d.status === "completed" || Number(d.current_balance) <= 0;
+    const typeInfo = DEBT_TYPES.find(t => t.value === d.debt_type);
+    const frequencyLabel = PAYMENT_FREQUENCIES.find(x => x.value === (d.payment_frequency || "monthly"))?.label || "Mensual";
+    const nextDue = formatDateDO(d.next_due_date);
+    const remaining = Number(d.remaining_installments) || 0;
+    const interestPaid = Number(d.total_interest_paid) || stats.interest;
+    const principalPaid = stats.principal || Math.max(0, Number(d.original_amount) - Number(d.principal_outstanding ?? d.current_balance));
+    const feesPaid = Number(d.total_fees_paid) || stats.fees;
+
+    return `
       <div class="card">
-        <div class="row-between" style="margin-bottom:6px;">
-          <span style="font-weight:500;">${typeInfo ? typeInfo.icon : "📄"} ${esc(d.name)}</span>
-          <div style="display:flex; gap:6px;">
-            <button data-edit-debt="${d.id}" style="background:none; color:var(--text-muted); font-size:12px;">✎</button>
-            <button data-del-debt="${d.id}" style="background:none; color:var(--text-muted); font-size:12px;">✕</button>
+        <div class="row-between" style="margin-bottom:6px;align-items:flex-start;">
+          <div>
+            <span style="font-weight:600;">${typeInfo ? typeInfo.icon : "📄"} ${esc(d.name)}</span>
+            <p style="font-size:10px;color:var(--text-muted);margin:3px 0 0;">${esc(debtPlanLabel(d.plan_type || "legacy"))}</p>
+          </div>
+          <div style="display:flex;gap:6px;">
+            <button aria-label="Editar deuda" data-edit-debt="${d.id}" style="background:none;color:var(--text-muted);font-size:12px;">✎</button>
+            <button aria-label="Borrar deuda" data-del-debt="${d.id}" style="background:none;color:var(--text-muted);font-size:12px;">✕</button>
           </div>
         </div>
-        <p style="font-size:11px; color:var(--text-muted); margin:0 0 6px;">
-          ${typeInfo ? typeInfo.label : "Otro"}${d.interest_rate ? ` · ${d.interest_rate}% anual` : ""}
+
+        <p style="font-size:11px;color:var(--text-muted);margin:0 0 7px;">
+          ${typeInfo ? typeInfo.label : "Otro"} · ${debtRateLabel(d)}
         </p>
+
         ${isPaidOff
-          ? `<p style="font-size:13px; font-weight:600; color:var(--success-text); margin:0 0 4px;">✓ Deuda pagada</p>`
-          : `<p style="font-size:15px; font-weight:600; color:var(--teal); margin:0 0 4px;">Debes ${money(d.current_balance)}</p>`
+          ? `<p style="font-size:13px;font-weight:600;color:var(--success-text);margin:0 0 5px;">✓ Deuda pagada</p>`
+          : `<p style="font-size:16px;font-weight:600;color:var(--teal);margin:0 0 5px;">Saldo pendiente: ${money(d.current_balance)}</p>`
         }
-        <p style="font-size:11px; color:var(--text-muted); margin:0 0 6px;">Pagaste ${money(paid)} de ${money(d.original_amount)}</p>
-        <div class="progress-bar"><div class="progress-fill" style="width:${pct}%;"></div></div>
+
+        ${totalPlan > 0 ? `<div class="progress-bar"><div class="progress-fill" style="width:${pct}%;"></div></div>` : ""}
+        <p style="font-size:10px;color:var(--text-muted);margin:5px 0 8px;">${isVariableDebt ? `Pagos aplicados registrados: ${money(totalPaid)}. El total final es variable.` : `Has pagado ${money(totalPaid)}${totalPlan > 0 ? ` de un total estimado de ${money(totalPlan)}` : ""}.`}</p>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:5px 10px;padding:8px 0;border-top:1px solid var(--border);border-bottom:1px solid var(--border);">
+          <div><span style="font-size:9px;color:var(--text-muted);display:block;">${isVariableDebt ? "Saldo reportado" : "Capital pendiente"}</span><strong style="font-size:11px;">${money(d.principal_outstanding ?? d.current_balance)}</strong></div>
+          <div><span style="font-size:9px;color:var(--text-muted);display:block;">${isVariableDebt ? "Interés separado pendiente" : "Interés pendiente"}</span><strong style="font-size:11px;">${money(d.interest_outstanding || 0)}</strong></div>
+          <div><span style="font-size:9px;color:var(--text-muted);display:block;">Interés pagado</span><strong style="font-size:11px;">${money(interestPaid)}</strong></div>
+          ${!isVariableDebt ? `<div><span style="font-size:9px;color:var(--text-muted);display:block;">Capital pagado</span><strong style="font-size:11px;">${money(principalPaid)}</strong></div>` : ""}
+          ${feesPaid > 0 ? `<div><span style="font-size:9px;color:var(--text-muted);display:block;">Cargos pagados</span><strong style="font-size:11px;">${money(feesPaid)}</strong></div>` : ""}
+          ${remaining > 0 ? `<div><span style="font-size:9px;color:var(--text-muted);display:block;">Cuotas restantes</span><strong style="font-size:11px;">${remaining}</strong></div>` : ""}
+        </div>
+
         ${!isPaidOff ? `
-          <div class="row-between" style="margin-top:8px;">
-            ${d.minimum_payment ? `<span style="font-size:11px; color:var(--text-muted);">Cuota sugerida: ${money(d.minimum_payment)}</span>` : `<span></span>`}
-            <button data-pay-debt="${d.id}" class="btn-secondary" style="padding:6px 12px; font-size:12px;">Registrar pago</button>
+          <div class="row-between" style="margin-top:9px;align-items:flex-end;">
+            <div>
+              <span style="font-size:10px;color:var(--text-muted);display:block;">${scheduled ? "Cuota estimada/acordada" : "Cuota"}</span>
+              <strong style="font-size:12px;">${scheduled ? `${money(scheduled)} · ${frequencyLabel.toLowerCase()}` : "No definida"}</strong>
+              ${nextDue ? `<span style="font-size:9px;color:var(--text-muted);display:block;margin-top:2px;">Próximo pago: ${nextDue}</span>` : ""}
+            </div>
+            <button data-pay-debt="${d.id}" class="btn-secondary" style="padding:7px 12px;font-size:11px;">Registrar pago</button>
           </div>
         ` : ""}
+
+        ${stats.payments.length > 0 ? `<button data-view-debt-history="${d.id}" style="width:100%;margin-top:8px;background:none;color:var(--teal);font-size:10px;text-decoration:underline;">Ver historial de ${stats.payments.length} pago${stats.payments.length === 1 ? "" : "s"}</button>` : ""}
       </div>
     `;
-    }).join("")}
+  }).join("");
+
+  return `
+    <h1 style="text-align:left;margin-bottom:14px;">Tus deudas</h1>
+    ${debtCards || `<div class="empty-state"><div class="icon-circle">📄</div><p style="font-size:13px;color:var(--text-muted);">No tienes deudas registradas.</p></div>`}
     ${debtAddForm()}
   `;
 }
 
 function debtAddForm() {
   return `
-    <div style="margin-top:14px;">
-      <input id="newDName" placeholder="Ej. Tarjeta Banco X" style="margin-bottom:8px;" />
+    <details class="card" id="debtCreateCard" style="margin-top:14px;" ${state.debts.length === 0 ? "open" : ""}>
+      <summary style="font-size:13px;font-weight:600;cursor:pointer;">+ Agregar deuda</summary>
+      <div style="padding-top:12px;">
+
+      <label>Nombre</label>
+      <input id="newDName" placeholder="Ej. Préstamo personal" style="margin-bottom:8px;" />
+
       <label for="newDType">Tipo de deuda</label>
       <select id="newDType" style="margin-bottom:8px;">
         <option value="" selected>Selecciona un tipo</option>
         ${DEBT_TYPES.map(t => `<option value="${t.value}">${t.icon} ${t.label}</option>`).join("")}
       </select>
-      <input id="newDAmount" type="number" step="1" min="0" placeholder="Monto total de la deuda" style="margin-bottom:8px;" />
-      <label>Tasa de interés anual <span style="color:var(--text-muted);">(opcional, en %)</span></label>
-      <input id="newDInterest" type="number" step="1" min="0" placeholder="Ej. 45" style="margin-bottom:8px;" />
-      <label>¿En cuántas cuotas planeas pagarla? <span style="color:var(--text-muted);">(opcional)</span></label>
-      <input id="newDInstallments" type="number" step="1" min="0" placeholder="Ej. 10" style="margin-bottom:8px;" />
-      <button class="btn-secondary" id="addDebtBtn" style="width:100%;">+ Agregar deuda</button>
-    </div>
+
+      <label>¿Cómo se calculan los intereses?</label>
+      <select id="newDPlanType" style="margin-bottom:8px;">
+        ${DEBT_PLAN_TYPES.filter(x => x.value !== "legacy").map(x => `<option value="${x.value}">${x.label}</option>`).join("")}
+      </select>
+
+      <label>Capital original o dinero recibido</label>
+      <input id="newDAmount" type="number" step="0.01" min="0" placeholder="RD$0" style="margin-bottom:8px;" />
+
+      <div id="newDInterestGroup">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+          <div>
+            <label id="newDInterestLabel" style="font-size:10px;">Tasa de interés (%)</label>
+            <input id="newDInterest" type="number" step="0.01" min="0" placeholder="Ej. 45" style="margin-bottom:8px;" />
+          </div>
+          <div>
+            <label style="font-size:10px;">La tasa es</label>
+            <select id="newDRateType" style="margin-bottom:8px;">
+              <option value="annual">Anual</option>
+              <option value="monthly">Mensual</option>
+              <option value="per_period">Por cada cuota</option>
+              <option value="total_term">Total por todo el acuerdo</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div id="newDTermGroup">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+          <div>
+            <label style="font-size:10px;">Frecuencia de pago</label>
+            <select id="newDFrequency" style="margin-bottom:8px;">
+              ${PAYMENT_FREQUENCIES.map(x => `<option value="${x.value}">${x.label}</option>`).join("")}
+            </select>
+          </div>
+          <div>
+            <label style="font-size:10px;">Cantidad total de cuotas</label>
+            <input id="newDInstallments" type="number" step="1" min="1" placeholder="Ej. 10" style="margin-bottom:8px;" />
+          </div>
+        </div>
+      </div>
+
+      <label>Cuota acordada <span style="color:var(--text-muted);">(opcional)</span></label>
+      <input id="newDScheduledPayment" type="number" step="0.01" min="0" placeholder="Se calcula automáticamente" style="margin-bottom:8px;" />
+
+      <details style="margin:4px 0 10px;">
+        <summary style="font-size:11px;color:var(--teal);cursor:pointer;">La deuda ya está en curso o quiero agregar fechas</summary>
+        <div style="padding-top:9px;">
+          <label>Saldo total pendiente hoy <span style="color:var(--text-muted);">(opcional)</span></label>
+          <input id="newDCurrentBalance" type="number" step="0.01" min="0" placeholder="Si está vacío, se calcula" style="margin-bottom:8px;" />
+          <label>Capital pendiente hoy <span style="color:var(--text-muted);">(opcional)</span></label>
+          <input id="newDCurrentPrincipal" type="number" step="0.01" min="0" placeholder="Ej. 18,000" style="margin-bottom:8px;" />
+          <label>Cuotas restantes <span style="color:var(--text-muted);">(opcional)</span></label>
+          <input id="newDRemainingInstallments" type="number" step="1" min="0" placeholder="Ej. 5" style="margin-bottom:8px;" />
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+            <div><label style="font-size:10px;">Fecha de inicio</label><input id="newDStartDate" type="date" style="margin-bottom:8px;" /></div>
+            <div><label style="font-size:10px;">Próximo pago</label><input id="newDNextDue" type="date" style="margin-bottom:8px;" /></div>
+          </div>
+        </div>
+      </details>
+
+      <div id="newDDebtPreview"></div>
+      <button class="btn-secondary" id="addDebtBtn" style="width:100%;margin-top:10px;">Guardar deuda</button>
+      </div>
+    </details>
   `;
 }
 
@@ -2668,6 +3104,248 @@ function tplPresupuestos() {
       : `<p style="font-size:11px; color:var(--text-muted); text-align:center; margin-top:8px;">Todas las categorías ya tienen presupuesto.</p>`
     }
   `;
+}
+
+function debtFormElements(prefix) {
+  const byId = suffix => document.getElementById(`${prefix}${suffix}`);
+  return {
+    name: byId("Name"), type: byId("Type"), planType: byId("PlanType"),
+    amount: byId("Amount"), interest: byId("Interest"), rateType: byId("RateType"),
+    frequency: byId("Frequency"), installments: byId("Installments"),
+    scheduledPayment: byId("ScheduledPayment"), currentBalance: byId("CurrentBalance"),
+    currentPrincipal: byId("CurrentPrincipal"), remainingInstallments: byId("RemainingInstallments"),
+    startDate: byId("StartDate"), nextDue: byId("NextDue"), preview: byId("DebtPreview"),
+    interestGroup: byId("InterestGroup"), termGroup: byId("TermGroup"),
+    interestLabel: byId("InterestLabel"),
+  };
+}
+
+function suggestedPlanForDebtType(debtType) {
+  if (debtType === "tarjeta_credito") return "credit_card";
+  if (debtType === "prestamista") return "flat_total";
+  return "amortized";
+}
+
+function applyDebtFormMode(prefix, { keepCurrentRateType = false } = {}) {
+  const e = debtFormElements(prefix);
+  if (!e.planType) return;
+  const planType = e.planType.value;
+
+  if (e.interestGroup) e.interestGroup.style.display = planType === "no_interest" ? "none" : "block";
+  if (e.termGroup) e.termGroup.style.display = planType === "credit_card" ? "none" : "block";
+
+  if (e.rateType) {
+    e.rateType.disabled = ["flat_total", "flat_periodic", "no_interest"].includes(planType);
+    if (!keepCurrentRateType) {
+      if (planType === "flat_total") e.rateType.value = "total_term";
+      else if (planType === "flat_periodic") e.rateType.value = "per_period";
+      else if (planType === "credit_card") e.rateType.value = "annual";
+      else if (planType === "no_interest") e.rateType.value = "annual";
+      else if (!["annual", "monthly", "per_period"].includes(e.rateType.value)) e.rateType.value = "annual";
+    }
+  }
+
+  if (e.interestLabel) {
+    e.interestLabel.textContent = planType === "flat_total"
+      ? "Interés total del acuerdo (%)"
+      : planType === "flat_periodic"
+        ? "Interés por cada cuota (%)"
+        : planType === "credit_card"
+          ? "Tasa de la tarjeta (%)"
+          : "Tasa de interés (%)";
+  }
+
+  if (planType === "credit_card" && e.frequency) e.frequency.value = "monthly";
+  renderDebtFormPreview(prefix);
+}
+
+function debtFormData(prefix, existingDebt = null) {
+  const e = debtFormElements(prefix);
+  const planType = e.planType?.value || existingDebt?.plan_type || "amortized";
+  const originalAmount = Number(e.amount?.value) || Number(existingDebt?.original_amount) || 0;
+  const interestRate = planType === "no_interest" ? 0 : (Number(e.interest?.value) || 0);
+  const interestRateType = planType === "flat_total" ? "total_term"
+    : planType === "flat_periodic" ? "per_period"
+    : (e.rateType?.value || existingDebt?.interest_rate_type || "annual");
+  const paymentFrequency = planType === "credit_card" ? "monthly" : (e.frequency?.value || existingDebt?.payment_frequency || "monthly");
+  const termCount = planType === "credit_card" ? 0 : Math.max(0, Math.trunc(Number(e.installments?.value) || Number(existingDebt?.term_count) || 0));
+  const scheduledPaymentInput = Math.max(0, Number(e.scheduledPayment?.value) || 0);
+
+  const planBaseAmount = existingDebt
+    ? Math.max(0, Number(existingDebt.principal_outstanding ?? existingDebt.current_balance) || 0)
+    : originalAmount;
+  const planTerm = existingDebt
+    ? Math.max(0, Math.trunc(Number(e.remainingInstallments?.value) || Number(existingDebt.remaining_installments) || termCount))
+    : termCount;
+
+  const plan = calculateDebtPlan({
+    planType,
+    originalAmount: planBaseAmount,
+    interestRate,
+    interestRateType,
+    paymentFrequency,
+    termCount: planTerm,
+    scheduledPayment: scheduledPaymentInput,
+  });
+  const effectiveTermCount = planType === "amortized" && plan.payoffPeriods
+    ? plan.payoffPeriods
+    : termCount;
+
+  const currentPrincipalInput = Number(e.currentPrincipal?.value);
+  const currentBalanceInput = Number(e.currentBalance?.value);
+  const currentPrincipal = existingDebt
+    ? Math.max(0, Number(existingDebt.principal_outstanding ?? existingDebt.current_balance) || 0)
+    : (Number.isFinite(currentPrincipalInput) && currentPrincipalInput >= 0 ? currentPrincipalInput : originalAmount);
+
+  const existingPaymentCount = existingDebt ? debtPaymentStats(existingDebt.id).payments.length : 0;
+  const convertingLegacyPlan = Boolean(
+    existingDebt &&
+    existingPaymentCount === 0 &&
+    (existingDebt.plan_type || "legacy") === "legacy" &&
+    planType !== "legacy"
+  );
+
+  let currentBalance;
+  let interestOutstanding;
+  if (existingDebt && !convertingLegacyPlan) {
+    currentBalance = Math.max(0, Number(existingDebt.current_balance) || 0);
+    interestOutstanding = Math.max(0, Number(existingDebt.interest_outstanding) || 0);
+  } else if (existingDebt && convertingLegacyPlan) {
+    if (["flat_total", "flat_periodic"].includes(planType)) {
+      interestOutstanding = Math.max(0, plan.estimatedInterest);
+      currentBalance = currentPrincipal + interestOutstanding;
+    } else {
+      interestOutstanding = 0;
+      currentBalance = currentPrincipal;
+    }
+  } else if (Number.isFinite(currentBalanceInput) && currentBalanceInput > 0) {
+    currentBalance = currentBalanceInput;
+    interestOutstanding = Math.max(0, currentBalance - currentPrincipal);
+  } else if (["flat_total", "flat_periodic"].includes(planType)) {
+    interestOutstanding = Math.max(0, plan.estimatedInterest);
+    currentBalance = currentPrincipal + interestOutstanding;
+  } else {
+    interestOutstanding = 0;
+    currentBalance = currentPrincipal;
+  }
+
+  const remainingInstallmentsInput = Math.trunc(Number(e.remainingInstallments?.value) || 0);
+  const calculatedRemaining = planType === "amortized" && plan.payoffPeriods ? plan.payoffPeriods : planTerm;
+  const remainingInstallments = existingDebt
+    ? Math.max(0, remainingInstallmentsInput || calculatedRemaining || Number(existingDebt.remaining_installments) || planTerm)
+    : Math.max(0, remainingInstallmentsInput || effectiveTermCount);
+
+  const historicalPaid = existingDebt ? Math.max(0, Number(existingDebt.total_paid) || debtPaymentStats(existingDebt.id).total) : 0;
+  const historicalInterest = existingDebt ? Math.max(0, Number(existingDebt.total_interest_paid) || debtPaymentStats(existingDebt.id).interest) : 0;
+  const remainingProjectedTotal = plan.totalPayable == null ? null : plan.totalPayable;
+
+  return {
+    plan,
+    payload: {
+      name: e.name?.value?.trim() || existingDebt?.name || "",
+      debt_type: e.type?.value || existingDebt?.debt_type || "otro",
+      plan_type: planType,
+      original_amount: originalAmount,
+      current_balance: currentBalance,
+      principal_outstanding: currentPrincipal,
+      interest_outstanding: interestOutstanding,
+      interest_rate: interestRate,
+      interest_rate_type: interestRateType,
+      payment_frequency: paymentFrequency,
+      term_count: (existingDebt ? (termCount || Number(existingDebt.term_count) || null) : (effectiveTermCount || null)),
+      remaining_installments: remainingInstallments || null,
+      scheduled_payment: plan.scheduledPayment || null,
+      minimum_payment: plan.scheduledPayment || null,
+      total_payable: remainingProjectedTotal == null ? null : historicalPaid + remainingProjectedTotal,
+      estimated_total_interest: planType === "credit_card" ? null : historicalInterest + plan.estimatedInterest,
+      total_paid: historicalPaid,
+      total_interest_paid: historicalInterest,
+      total_fees_paid: existingDebt ? Math.max(0, Number(existingDebt.total_fees_paid) || debtPaymentStats(existingDebt.id).fees) : 0,
+      start_date: e.startDate?.value || existingDebt?.start_date || null,
+      next_due_date: e.nextDue?.value || existingDebt?.next_due_date || null,
+      due_day: Number((e.nextDue?.value || existingDebt?.next_due_date || "").slice(-2)) || existingDebt?.due_day || null,
+      status: existingDebt?.status === "completed" && currentBalance > 0 ? "active" : (existingDebt?.status || "active"),
+    },
+  };
+}
+
+function validateDebtForm(prefix, existingDebt = null) {
+  const { payload, plan } = debtFormData(prefix, existingDebt);
+  if (!payload.name || !payload.debt_type || payload.original_amount <= 0) {
+    return { error: "Completa el nombre, el tipo y el capital original." };
+  }
+  if (payload.interest_rate < 0) return { error: "La tasa de interés no puede ser negativa." };
+  if (!["credit_card", "legacy"].includes(payload.plan_type) && !payload.term_count) {
+    return { error: "Indica la cantidad de cuotas del acuerdo." };
+  }
+  if (payload.plan_type === "credit_card" && !(payload.scheduled_payment > 0)) {
+    return { error: "Indica el pago mínimo mensual de la tarjeta." };
+  }
+  if (payload.current_balance < payload.principal_outstanding) {
+    return { error: "El saldo total pendiente no puede ser menor que el capital pendiente." };
+  }
+  if (payload.principal_outstanding > payload.original_amount && !existingDebt) {
+    return { error: "El capital pendiente no puede superar el capital original." };
+  }
+  if (plan.scheduledPayment <= 0 && payload.plan_type !== "legacy") {
+    return { error: "No se pudo calcular una cuota. Revisa el plazo o escribe la cuota acordada." };
+  }
+  if (payload.plan_type === "amortized" && !plan.payoffPeriods) {
+    return { error: "La cuota no cubre los intereses y la deuda no terminaría de pagarse. Aumenta la cuota o el plazo." };
+  }
+  const planPeriods = existingDebt ? payload.remaining_installments : payload.term_count;
+  if (["flat_total", "flat_periodic", "no_interest"].includes(payload.plan_type) && planPeriods > 0 && plan.totalPayable != null) {
+    const expectedPayment = plan.totalPayable / planPeriods;
+    if (Math.abs(plan.scheduledPayment - expectedPayment) > 1) {
+      return { error: `La cuota no coincide con el total del acuerdo. Usa ${money(expectedPayment)} o ajusta la cantidad de cuotas.` };
+    }
+  }
+  return { payload, plan, error: null };
+}
+
+function renderDebtFormPreview(prefix, existingDebt = null) {
+  const e = debtFormElements(prefix);
+  if (!e.preview) return;
+  const { payload, plan } = debtFormData(prefix, existingDebt);
+  e.preview.innerHTML = debtPlanPreviewHTML(plan, {
+    planType: payload.plan_type,
+    paymentFrequency: payload.payment_frequency,
+    termCount: existingDebt ? payload.remaining_installments : payload.term_count,
+    currentBalance: payload.current_balance > 0 ? payload.current_balance : null,
+  });
+}
+
+function wireDebtForm(prefix, existingDebt = null) {
+  const e = debtFormElements(prefix);
+  if (!e.planType) return;
+
+  const update = () => renderDebtFormPreview(prefix, existingDebt);
+  [e.amount, e.interest, e.rateType, e.frequency, e.installments, e.scheduledPayment,
+   e.currentBalance, e.currentPrincipal, e.remainingInstallments, e.startDate, e.nextDue]
+    .filter(Boolean).forEach(input => input.addEventListener("input", update));
+
+  e.planType.addEventListener("change", () => {
+    if (existingDebt && e.planType.value !== (existingDebt.plan_type || "legacy") && e.scheduledPayment) {
+      e.scheduledPayment.value = "";
+    }
+    applyDebtFormMode(prefix);
+  });
+  e.type?.addEventListener("change", () => {
+    if (!existingDebt) e.planType.value = suggestedPlanForDebtType(e.type.value);
+    applyDebtFormMode(prefix);
+  });
+
+  applyDebtFormMode(prefix, { keepCurrentRateType: Boolean(existingDebt) });
+}
+
+async function saveDebtFromForm(prefix, existingDebt = null) {
+  const result = validateDebtForm(prefix, existingDebt);
+  if (result.error) return { error: { message: result.error } };
+  const { data, error } = await supabase.rpc("save_debt", {
+    p_payload: result.payload,
+    p_debt_id: existingDebt?.id || null,
+  });
+  return { data, error };
 }
 
 // ---------------------------------------------------------------
@@ -2769,8 +3447,13 @@ function wireTabEvents() {
 
   document.querySelectorAll("[data-del-debt]").forEach(btn => {
     btn.addEventListener("click", async () => {
+      const debtId = btn.dataset.delDebt;
+      if (debtPaymentStats(debtId).payments.length > 0) {
+        showToast("No puedes borrar una deuda con pagos registrados porque rompería el historial.", true);
+        return;
+      }
       if (!(await confirmAction("¿Borrar esta deuda?"))) return;
-      await deleteLocal("debts", btn.dataset.delDebt, "debts");
+      await deleteLocal("debts", debtId, "debts");
     });
   });
 
@@ -2873,25 +3556,26 @@ function wireTabEvents() {
 
 
   const addDebtBtn = document.getElementById("addDebtBtn");
-  if (addDebtBtn) addDebtBtn.addEventListener("click", async () => {
-    const name = document.getElementById("newDName").value.trim();
-    const debtType = document.getElementById("newDType").value;
-    const amount = document.getElementById("newDAmount").value;
-    const interest = document.getElementById("newDInterest").value;
-    const installments = document.getElementById("newDInstallments").value;
-    if (!name || !debtType || !amount) { showToast("Completa el nombre, el tipo y el monto.", true); return; }
-    if (interest && Number(interest) < 0) { showToast("La tasa de interés no puede ser negativa.", true); return; }
-    const minimumPayment = installments && Number(installments) > 0
-      ? Math.round(calcPMT(Number(amount), Number(interest) || 0, Number(installments)))
-      : null;
-    const { error } = await supabase.from("debts").insert({
-      user_id: user.id, name, debt_type: debtType,
-      original_amount: Number(amount), current_balance: Number(amount),
-      interest_rate: interest ? Number(interest) : null,
-      minimum_payment: minimumPayment,
+  if (addDebtBtn) {
+    wireDebtForm("newD");
+    addDebtBtn.addEventListener("click", async () => {
+      addDebtBtn.disabled = true;
+      addDebtBtn.textContent = "Guardando…";
+      const { error } = await saveDebtFromForm("newD");
+      if (error) {
+        showToast(error.message || "No se pudo guardar la deuda.", true);
+        addDebtBtn.disabled = false;
+        addDebtBtn.textContent = "Guardar deuda";
+        return;
+      }
+      await loadState();
+      renderApp();
+      showToast("Deuda guardada con su plan de pago");
     });
-    if (error) { showToast("No se pudo guardar. Intenta de nuevo.", true); return; }
-    await loadState(); renderApp();
+  }
+
+  document.querySelectorAll("[data-view-debt-history]").forEach(btn => {
+    btn.addEventListener("click", () => openDebtHistoryModal(btn.dataset.viewDebtHistory));
   });
 
   document.querySelectorAll("[data-pay-debt]").forEach(btn => {
@@ -2900,52 +3584,120 @@ function wireTabEvents() {
 }
 
 // ---------------------------------------------------------------
-// MODAL: EDITAR DEUDA (nombre, tipo, tasa — no el saldo, eso solo
-// cambia registrando un pago, para no perder el rastro de auditoría)
+// MODAL: EDITAR DEUDA Y SU PLAN DE PAGO
 // ---------------------------------------------------------------
 function openEditDebtModal(debtId) {
   const d = state.debts.find(x => x.id === debtId);
+  if (!d) return;
   const modal = document.getElementById("logModal");
+  const hasPayments = debtPaymentStats(d.id).payments.length > 0;
   modal.classList.add("visible");
   modal.innerHTML = `
-    <div class="modal-box">
+    <div class="modal-box" style="max-height:88vh;overflow-y:auto;">
       <p class="step-label">Editar deuda</p>
+
       <label>Nombre</label>
-      <input id="edName" value="${esc(d.name)}" style="margin-bottom:10px;" />
+      <input id="edDName" value="${esc(d.name)}" style="margin-bottom:8px;" />
+
       <label>Tipo de deuda</label>
-      <select id="edType" style="margin-bottom:10px;">
+      <select id="edDType" style="margin-bottom:8px;">
         ${DEBT_TYPES.map(t => `<option value="${t.value}" ${d.debt_type === t.value ? "selected" : ""}>${t.icon} ${t.label}</option>`).join("")}
       </select>
-      <label>Tasa de interés anual (%)</label>
-      <input id="edInterest" type="number" step="1" min="0" value="${d.interest_rate ?? ""}" style="margin-bottom:16px;" />
-      <div class="btn-row">
+
+      <label>Modelo de intereses</label>
+      <select id="edDPlanType" style="margin-bottom:4px;">
+        ${DEBT_PLAN_TYPES.map(x => `<option value="${x.value}" ${(d.plan_type || "legacy") === x.value ? "selected" : ""}>${x.label}</option>`).join("")}
+      </select>
+      <p style="font-size:9px;color:var(--text-muted);margin:0 0 8px;line-height:1.4;">Cambiar el modelo actualiza las proyecciones futuras y nunca reescribe pagos. En un registro básico sin pagos, el saldo puede recalcularse para incluir el interés acordado.</p>
+
+      <label>Capital original</label>
+      <input id="edDAmount" type="number" step="0.01" min="0" value="${Number(d.original_amount) || 0}" ${hasPayments ? "disabled" : ""} style="margin-bottom:4px;" />
+      ${hasPayments ? `<p style="font-size:9px;color:var(--text-muted);margin:0 0 8px;">No puede cambiarse porque ya existen pagos registrados.</p>` : `<div style="margin-bottom:4px;"></div>`}
+
+      <div id="edDInterestGroup">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+          <div>
+            <label id="edDInterestLabel" style="font-size:10px;">Tasa (%)</label>
+            <input id="edDInterest" type="number" step="0.01" min="0" value="${d.interest_rate ?? 0}" style="margin-bottom:8px;" />
+          </div>
+          <div>
+            <label style="font-size:10px;">La tasa es</label>
+            <select id="edDRateType" style="margin-bottom:8px;">
+              <option value="annual" ${(d.interest_rate_type || "annual") === "annual" ? "selected" : ""}>Anual</option>
+              <option value="monthly" ${d.interest_rate_type === "monthly" ? "selected" : ""}>Mensual</option>
+              <option value="per_period" ${d.interest_rate_type === "per_period" ? "selected" : ""}>Por cada cuota</option>
+              <option value="total_term" ${d.interest_rate_type === "total_term" ? "selected" : ""}>Total del acuerdo</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div id="edDTermGroup">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+          <div>
+            <label style="font-size:10px;">Frecuencia</label>
+            <select id="edDFrequency" style="margin-bottom:8px;">
+              ${PAYMENT_FREQUENCIES.map(x => `<option value="${x.value}" ${(d.payment_frequency || "monthly") === x.value ? "selected" : ""}>${x.label}</option>`).join("")}
+            </select>
+          </div>
+          <div>
+            <label style="font-size:10px;">Cuotas originales</label>
+            <input id="edDInstallments" type="number" step="1" min="1" value="${d.term_count ?? ""}" style="margin-bottom:8px;" />
+          </div>
+        </div>
+      </div>
+
+      <label>Cuota acordada <span style="color:var(--text-muted);">(opcional)</span></label>
+      <input id="edDScheduledPayment" type="number" step="0.01" min="0" value="${d.scheduled_payment ?? d.minimum_payment ?? ""}" style="margin-bottom:4px;" />
+      <button type="button" id="edDRecalcPayment" style="width:100%;background:none;color:var(--teal);font-size:10px;margin-bottom:8px;">Recalcular cuota con la tasa y el plazo</button>
+
+      <label>Cuotas restantes</label>
+      <input id="edDRemainingInstallments" type="number" step="1" min="0" value="${d.remaining_installments ?? ""}" style="margin-bottom:8px;" />
+
+      <input id="edDCurrentBalance" type="hidden" value="${Number(d.current_balance) || 0}" />
+      <input id="edDCurrentPrincipal" type="hidden" value="${Number(d.principal_outstanding ?? d.current_balance) || 0}" />
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+        <div><label style="font-size:10px;">Fecha de inicio</label><input id="edDStartDate" type="date" value="${d.start_date || ""}" style="margin-bottom:8px;" /></div>
+        <div><label style="font-size:10px;">Próximo pago</label><input id="edDNextDue" type="date" value="${d.next_due_date || ""}" style="margin-bottom:8px;" /></div>
+      </div>
+
+      <div id="edDDebtPreview"></div>
+
+      <div class="btn-row" style="margin-top:12px;">
         <button class="btn-secondary" id="cancelEditDebt">Cancelar</button>
         <button class="btn-primary" id="saveEditDebt">Guardar</button>
       </div>
     </div>
   `;
-  document.getElementById("cancelEditDebt").addEventListener("click", () => { modal.classList.remove("visible"); modal.innerHTML = ""; });
+
+  wireDebtForm("edD", d);
+  document.getElementById("edDRecalcPayment").addEventListener("click", () => {
+    document.getElementById("edDScheduledPayment").value = "";
+    renderDebtFormPreview("edD", d);
+    showToast("Cuota recalculada en la vista previa");
+  });
+  document.getElementById("cancelEditDebt").addEventListener("click", () => {
+    modal.classList.remove("visible");
+    modal.innerHTML = "";
+  });
+
   document.getElementById("saveEditDebt").addEventListener("click", async () => {
-    const name = document.getElementById("edName").value.trim();
-    const debtType = document.getElementById("edType").value;
-    const interest = document.getElementById("edInterest").value;
-    if (!name) { showToast("El nombre no puede quedar vacío.", true); return; }
-    if (interest && Number(interest) < 0) { showToast("La tasa de interés no puede ser negativa.", true); return; }
     const saveBtn = document.getElementById("saveEditDebt");
     saveBtn.disabled = true;
     saveBtn.textContent = "Guardando…";
-    const { error } = await supabase.from("debts").update({
-      name, debt_type: debtType, interest_rate: interest ? Number(interest) : null,
-    }).eq("id", debtId);
+    const { error } = await saveDebtFromForm("edD", d);
     if (error) {
-      showToast("No se pudo guardar. Intenta de nuevo.", true);
+      showToast(error.message || "No se pudo actualizar la deuda.", true);
       saveBtn.disabled = false;
       saveBtn.textContent = "Guardar";
       return;
     }
-    modal.classList.remove("visible"); modal.innerHTML = "";
-    await loadState(); renderApp();
-    showToast("Deuda actualizada");
+    modal.classList.remove("visible");
+    modal.innerHTML = "";
+    await loadState();
+    renderApp();
+    showToast("Deuda y plan actualizados");
   });
 }
 
@@ -3045,75 +3797,190 @@ function openEditTxModal(txId) {
 }
 
 // ---------------------------------------------------------------
+// MODAL: HISTORIAL DE PAGOS DE DEUDA
+// ---------------------------------------------------------------
+function openDebtHistoryModal(debtId) {
+  const d = state.debts.find(x => x.id === debtId);
+  if (!d) return;
+  const payments = debtPaymentStats(debtId).payments
+    .slice()
+    .sort((a, b) => new Date(b.paid_at || 0) - new Date(a.paid_at || 0));
+  const modal = document.getElementById("logModal");
+  modal.classList.add("visible");
+  modal.innerHTML = `
+    <div class="modal-box" style="max-height:85vh;overflow-y:auto;">
+      <p class="step-label">Historial — ${esc(d.name)}</p>
+      ${payments.length === 0 ? `<p style="font-size:12px;color:var(--text-muted);text-align:center;">No hay pagos registrados.</p>` : payments.map((p, index) => `
+        <div class="card" style="margin-bottom:7px;padding:10px 12px;">
+          <div class="row-between" style="margin-bottom:5px;">
+            <strong style="font-size:12px;">Pago ${p.payment_number || (payments.length - index)}</strong>
+            <span style="font-size:10px;color:var(--text-muted);">${formatDateDO(p.paid_at) || "Sin fecha"}</span>
+          </div>
+          <div class="row-between" style="font-size:11px;margin-bottom:3px;"><span>Total pagado</span><strong>${money(p.amount)}</strong></div>
+          <div class="row-between" style="font-size:10px;color:var(--text-muted);margin-bottom:2px;"><span>A capital</span><span>${money(p.principal_component || 0)}</span></div>
+          <div class="row-between" style="font-size:10px;color:var(--text-muted);margin-bottom:2px;"><span>A intereses</span><span>${money(p.interest_component || 0)}</span></div>
+          ${Number(p.fee_component) > 0 ? `<div class="row-between" style="font-size:10px;color:var(--text-muted);margin-bottom:2px;"><span>Cargos</span><span>${money(p.fee_component)}</span></div>` : ""}
+          <div class="row-between" style="font-size:10px;padding-top:5px;margin-top:5px;border-top:1px solid var(--border);"><span>Saldo después</span><strong>${money(p.balance_after)}</strong></div>
+        </div>
+      `).join("")}
+      <button class="btn-secondary" id="closeDebtHistory" style="width:100%;">Cerrar</button>
+    </div>
+  `;
+  document.getElementById("closeDebtHistory").addEventListener("click", () => {
+    modal.classList.remove("visible");
+    modal.innerHTML = "";
+  });
+}
+
+// ---------------------------------------------------------------
 // MODAL: REGISTRAR PAGO DE DEUDA
 // ---------------------------------------------------------------
 function openPayDebtModal(debtId) {
   const d = state.debts.find(x => x.id === debtId);
+  if (!d) return;
   const modal = document.getElementById("logModal");
   modal.classList.add("visible");
 
-  // P2: cuota sugerida con PMT real, no división simple
-  const cuotaSugerida = d.minimum_payment ? Math.round(d.minimum_payment) : null;
-
-  // Calcular total de intereses restantes si mantiene la cuota sugerida
-  let interesInfo = "";
-  if (cuotaSugerida && d.interest_rate && Number(d.interest_rate) > 0) {
-    const i = Number(d.interest_rate) / 100 / 12;
-    const bal = Number(d.current_balance);
-    if (cuotaSugerida > bal * i) {
-      const cuotas = Math.ceil(Math.log(cuotaSugerida / (cuotaSugerida - bal * i)) / Math.log(1 + i));
-      const totalIntereses = Math.round((cuotaSugerida * cuotas) - bal);
-      if (totalIntereses > 0 && cuotas > 0 && isFinite(cuotas)) {
-        interesInfo = `<p style="font-size:11px;color:var(--text-muted);margin:0 0 12px;line-height:1.5;">
-          Con esta cuota terminas en <strong>${cuotas} meses</strong> pagando <strong>${money(totalIntereses)}</strong> en intereses.
-        </p>`;
-      }
-    }
-  }
+  const scheduled = Math.max(0, Number(d.scheduled_payment ?? d.minimum_payment) || 0);
+  const periodicPreview = estimateDebtPaymentBreakdown(d, scheduled || Number(d.current_balance), null, 0);
+  const maximumDueNow = Math.max(0,
+    Number(d.current_balance) +
+    (d.plan_type === "amortized" ? periodicPreview.interestCharge : 0)
+  );
+  const defaultAmount = scheduled > 0 ? Math.min(scheduled, maximumDueNow || scheduled) : maximumDueNow;
 
   modal.innerHTML = `
-    <div class="modal-box">
+    <div class="modal-box" style="max-height:88vh;overflow-y:auto;">
       <p class="step-label">Registrar pago — ${esc(d.name)}</p>
-      <p style="font-size:12px; color:var(--text-muted); text-align:center; margin:0 0 14px;">Debes ${money(d.current_balance)} ahora mismo.</p>
-      <label>Monto a pagar</label>
-      <input id="payAmount" type="number" step="1" min="0" value="${cuotaSugerida ?? ""}" placeholder="RD$0" style="margin-bottom:4px;" />
-      ${cuotaSugerida ? `<p style="font-size:11px;color:var(--text-muted);margin:0 0 8px;">Cuota sugerida: ${money(cuotaSugerida)} — puedes cambiarla.</p>` : ""}
-      ${interesInfo}
+      <div class="card accent" style="margin-bottom:12px;">
+        <div class="row-between" style="font-size:11px;margin-bottom:4px;"><span>Saldo pendiente</span><strong>${money(d.current_balance)}</strong></div>
+        <div class="row-between" style="font-size:11px;margin-bottom:4px;"><span>Modelo</span><strong style="text-align:right;max-width:60%;">${esc(debtPlanLabel(d.plan_type || "legacy"))}</strong></div>
+        <div class="row-between" style="font-size:11px;"><span>Tasa</span><strong>${debtRateLabel(d)}</strong></div>
+      </div>
+
+      <label>Monto total pagado</label>
+      <input id="payAmount" type="number" step="0.01" min="0" value="${defaultAmount > 0 ? Math.round(defaultAmount * 100) / 100 : ""}" placeholder="RD$0" style="margin-bottom:8px;" />
+
+      <label>Interés incluido en este pago <span style="color:var(--text-muted);">(opcional)</span></label>
+      <input id="payInterest" type="number" step="0.01" min="0" placeholder="Déjalo vacío para estimarlo" style="margin-bottom:4px;" />
+      <p style="font-size:9px;color:var(--text-muted);margin:0 0 8px;line-height:1.4;">Úsalo cuando el estado de cuenta o el prestamista indique cuánto fue interés. Si está vacío, la app aplica el modelo registrado.</p>
+
+      <label>Cargos, mora o comisión incluidos <span style="color:var(--text-muted);">(opcional)</span></label>
+      <input id="payFee" type="number" step="0.01" min="0" value="0" style="margin-bottom:8px;" />
+
+      <div id="payBreakdownPreview"></div>
       <div class="error-banner" id="payErr"></div>
-      <div class="btn-row">
+      <div class="btn-row" style="margin-top:12px;">
         <button class="btn-secondary" id="cancelPay">Cancelar</button>
         <button class="btn-primary" id="savePay">Registrar pago</button>
       </div>
     </div>
   `;
-  document.getElementById("cancelPay").addEventListener("click", () => { modal.classList.remove("visible"); modal.innerHTML = ""; });
+
+  const amountInput = document.getElementById("payAmount");
+  const interestInput = document.getElementById("payInterest");
+  const feeInput = document.getElementById("payFee");
+  const previewEl = document.getElementById("payBreakdownPreview");
+
+  function renderBreakdown() {
+    const amount = Number(amountInput.value) || 0;
+    const fee = Number(feeInput.value) || 0;
+    const manualInterest = interestInput.value === "" ? null : Number(interestInput.value);
+    const b = estimateDebtPaymentBreakdown(d, amount, manualInterest, fee);
+    const warnings = [];
+    if (b.interestCharge > amount - fee && d.plan_type === "amortized") {
+      warnings.push("Este pago no cubre el interés estimado del período. El saldo podría aumentar.");
+    }
+    if (scheduled > 0 && amount - fee < scheduled - 0.01) {
+      warnings.push("Es un pago parcial: no reducirá la cantidad de cuotas ni moverá la próxima fecha de pago.");
+    }
+    const warning = warnings.map(text => `<p style="font-size:10px;color:var(--danger-text);margin:7px 0 0;">${text}</p>`).join("");
+    previewEl.innerHTML = `
+      <div class="card" style="padding:10px 12px;">
+        <p style="font-size:11px;font-weight:600;margin:0 0 7px;">Desglose estimado</p>
+        <div class="row-between" style="font-size:10px;margin-bottom:3px;"><span>A capital</span><strong>${money(b.principalComponent)}</strong></div>
+        <div class="row-between" style="font-size:10px;margin-bottom:3px;"><span>A intereses</span><strong>${money(b.interestComponent)}</strong></div>
+        <div class="row-between" style="font-size:10px;margin-bottom:3px;"><span>A cargos</span><strong>${money(b.fee)}</strong></div>
+        <div class="row-between" style="font-size:10px;padding-top:5px;margin-top:5px;border-top:1px solid var(--border);"><span>Saldo estimado después</span><strong>${money(b.newBalance)}</strong></div>
+        ${warning}
+      </div>
+    `;
+    return b;
+  }
+
+  [amountInput, interestInput, feeInput].forEach(input => input.addEventListener("input", renderBreakdown));
+  renderBreakdown();
+
+  document.getElementById("cancelPay").addEventListener("click", () => {
+    modal.classList.remove("visible");
+    modal.innerHTML = "";
+  });
+
   document.getElementById("savePay").addEventListener("click", async () => {
-    const amount = Number(document.getElementById("payAmount").value);
+    const amount = Number(amountInput.value);
+    const fee = Number(feeInput.value) || 0;
+    const manualInterest = interestInput.value === "" ? null : Number(interestInput.value);
     const errEl = document.getElementById("payErr");
+    const availableForDebt = amount - fee;
+
     if (!amount || amount <= 0) {
       errEl.textContent = "Pon un monto válido.";
       errEl.classList.add("visible");
       return;
     }
-    if (amount > Number(d.current_balance)) {
-      errEl.textContent = `Estás pagando más de lo que debes (${money(d.current_balance)}). Corrige el monto.`;
+    if (fee < 0 || fee > amount) {
+      errEl.textContent = "Los cargos no pueden superar el pago total.";
       errEl.classList.add("visible");
       return;
     }
-    const newBalance = Math.max(0, Number(d.current_balance) - amount);
-    const { error: rpcError } = await supabase.rpc("record_debt_payment", {
-      p_debt_id: d.id, p_account_id: state.account.id, p_amount: amount,
-    });
-    if (rpcError) {
-      console.error("record_debt_payment falló", rpcError);
-      errEl.textContent = rpcError.message || "No se pudo registrar el pago. Intenta de nuevo.";
+    if (manualInterest != null && (manualInterest < 0 || manualInterest > availableForDebt)) {
+      errEl.textContent = "El interés no puede superar el monto disponible después de cargos.";
+      errEl.classList.add("visible");
+      return;
+    }
+    if (d.plan_type === "no_interest" && Number(manualInterest) > 0) {
+      errEl.textContent = "Esta deuda está registrada sin intereses.";
+      errEl.classList.add("visible");
+      return;
+    }
+    if (["flat_total", "flat_periodic"].includes(d.plan_type) && Number(manualInterest) > Number(d.interest_outstanding || 0)) {
+      errEl.textContent = "El interés indicado supera el interés pendiente registrado.";
+      errEl.classList.add("visible");
+      return;
+    }
+    if (Number(state.analysis?.liquidity?.balanceToday) < amount) {
+      errEl.textContent = `No tienes ${money(amount)} disponibles hoy en la cuenta.`;
       errEl.classList.add("visible");
       return;
     }
 
-    modal.classList.remove("visible"); modal.innerHTML = "";
-    await loadState(); renderApp();
-    showToast("Pago registrado");
+    const saveBtn = document.getElementById("savePay");
+    saveBtn.disabled = true;
+    saveBtn.textContent = "Registrando…";
+
+    const { data, error: rpcError } = await supabase.rpc("record_debt_payment", {
+      p_debt_id: d.id,
+      p_account_id: state.account.id,
+      p_amount: amount,
+      p_interest_component: manualInterest,
+      p_fee_component: fee,
+    });
+
+    if (rpcError) {
+      console.error("record_debt_payment falló", rpcError);
+      errEl.textContent = rpcError.message || "No se pudo registrar el pago. Intenta de nuevo.";
+      errEl.classList.add("visible");
+      saveBtn.disabled = false;
+      saveBtn.textContent = "Registrar pago";
+      return;
+    }
+
+    const b = data && typeof data === "object" ? data : renderBreakdown();
+    modal.classList.remove("visible");
+    modal.innerHTML = "";
+    await loadState();
+    renderApp();
+    showToast(`Pago registrado: ${money(b.principal_component ?? b.principalComponent ?? 0)} a capital y ${money(b.interest_component ?? b.interestComponent ?? 0)} a intereses`);
   });
 }
 
